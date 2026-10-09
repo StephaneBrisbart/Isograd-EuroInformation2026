@@ -229,6 +229,7 @@ public sealed class Pools
     }
 
     public static int IdOf(long key) => (int)(key % K);
+    public static long KeyOf(int size, int id) => size * K + id;
     public static int SizeOf(long key) => (int)(key / K);
 
     public void Remove(int t, int c, long key) => _sets[t, c].Remove(key);
@@ -275,8 +276,16 @@ public sealed class Solver
     long _energyLeft;
     readonly bool[] _used;          // modèle entraîné (cible ou source)
     readonly List<(int t, int c, long key)> _journal = new();
-    readonly List<(int data, int model)> _dataMap = new();
-    readonly List<(int source, int target)> _modelMap = new();
+    // Affectation de chaque modèle cible entraîné : ses datasets, ses sources (et leurs datasets), sa valeur.
+    sealed class Assign
+    {
+        public int[] Data = Array.Empty<int>();
+        public (int src, int[] data)[] Sources = Array.Empty<(int, int[])>();
+        public long Gain;
+    }
+    readonly Dictionary<int, Assign> _assign = new();
+    long _score;
+    (int id, bool direct)[] _order = Array.Empty<(int, bool)>();
     readonly List<int>[] _sourceCandidates = new List<int>[4];
     readonly int[] _sourcePtr = new int[4];
     readonly double[] _srcEstimate = new double[4];
@@ -447,8 +456,8 @@ public sealed class Solver
         for (int k = 0; k < m.Types.Length && ok; k++)
             ok = FillRequirement(m.Types[k], m.Lb[k], m.Ub[k], FreeOnly, taken);
         if (!ok) { Rollback(mark); return false; }
-        Commit(m, taken, new List<(int, int)>(), new List<(int, int)>());
         gained = m.Value;
+        Commit(m, taken, new List<(int, int)>(), new List<(int, int)>(), gained);
         return true;
     }
 
@@ -491,8 +500,8 @@ public sealed class Solver
         {
             bool halved = srcMap.Count > 0 || taken.Any(x => x.c == 1);
             foreach (var (s, _) in srcMap) _energyLeft -= _inst.Models[s].Cost;
-            Commit(m, taken, srcData, srcMap);
             gained = halved ? m.Value / 2 : m.Value;
+            Commit(m, taken, srcData, srcMap, gained);
             return true;
         }
         Rollback(mark);
@@ -501,15 +510,97 @@ public sealed class Solver
         return false;
     }
 
-    void Commit(Model m, List<(int data, long key, int c)> taken, List<(int, int)> srcData, List<(int, int)> srcMap)
+    void Commit(Model m, List<(int data, long key, int c)> taken, List<(int, int)> srcData, List<(int, int)> srcMap, long gain)
     {
         _used[m.Id] = true;
         _energyLeft -= m.Cost;
-        foreach (var (d, _, _) in taken) _dataMap.Add((d, m.Id));
-        _dataMap.AddRange(srcData);
-        _modelMap.AddRange(srcMap);
+        _assign[m.Id] = new Assign
+        {
+            Data = taken.Select(x => x.data).ToArray(),
+            Sources = srcMap.Select(sm => (sm.Item1, srcData.Where(x => x.Item2 == sm.Item1).Select(x => x.Item1).ToArray())).ToArray(),
+            Gain = gain
+        };
+        _score += gain;
         _journal.Clear();
     }
+
+    long KeyOf(int dataId) { var d = _inst.Datasets[dataId]; return Pools.KeyOf(d.Size, d.Id); }
+
+    /// Retire un modèle cible (et ses sources) de la solution : ressources rendues.
+    Assign RemoveTarget(int id)
+    {
+        var a = _assign[id];
+        _assign.Remove(id);
+        foreach (int d in a.Data.Concat(a.Sources.SelectMany(x => x.data)))
+            _pools.Add(_inst.Datasets[d].Type, _inst.Datasets[d].Copy ? 1 : 0, KeyOf(d));
+        _energyLeft += _inst.Models[id].Cost;
+        _used[id] = false;
+        foreach (var (src, _) in a.Sources) { _energyLeft += _inst.Models[src].Cost; _used[src] = false; }
+        _score -= a.Gain;
+        return a;
+    }
+
+    /// Remet exactement une affectation retirée (ses ressources doivent être libres).
+    void Restore(int id, Assign a)
+    {
+        foreach (int d in a.Data.Concat(a.Sources.SelectMany(x => x.data)))
+            _pools.Remove(_inst.Datasets[d].Type, _inst.Datasets[d].Copy ? 1 : 0, KeyOf(d));
+        _energyLeft -= _inst.Models[id].Cost;
+        _used[id] = true;
+        foreach (var (src, _) in a.Sources) { _energyLeft -= _inst.Models[src].Cost; _used[src] = true; }
+        _score += a.Gain;
+        _assign[id] = a;
+    }
+
+    /// Passe gloutonne : essaie d'entraîner, dans l'ordre de priorité, les modèles encore libres.
+    List<int> InsertPass(HashSet<int>? tabu)
+    {
+        var inserted = new List<int>();
+        foreach (var (id, direct) in _order)
+        {
+            if (_used[id] || (tabu != null && tabu.Contains(id))) continue;
+            var m = _inst.Models[id];
+            if (m.Cost > _energyLeft) continue;
+            if ((direct && TryFullFree(m, out _)) || TryHalf(m, out _)) inserted.Add(id);
+        }
+        return inserted;
+    }
+
+    /// Recherche locale "détruire puis reconstruire" : on retire quelques modèles au hasard,
+    /// on réinsère glouton (sans eux), et on garde si le score ne baisse pas.
+    public int Improve(Func<bool> keepGoing, Random rng, int maxRemove)
+    {
+        int accepted = 0;
+        while (keepGoing())
+        {
+            long before = _score;
+            var keys = _assign.Keys.ToList();
+            if (keys.Count == 0) break;
+            int k = 1 + rng.Next(Math.Min(maxRemove, keys.Count));
+            var removed = new List<(int id, Assign a)>();
+            var tabu = new HashSet<int>();
+            for (int i = 0; i < k; i++)
+            {
+                int id = keys[rng.Next(keys.Count)];
+                if (!_assign.ContainsKey(id)) continue;
+                removed.Add((id, RemoveTarget(id)));
+                tabu.Add(id);
+            }
+            var inserted = InsertPass(tabu);
+            if (_score >= before) { if (_score > before) accepted++; continue; }
+            foreach (int id in inserted) RemoveTarget(id);
+            foreach (var (id, a) in removed) Restore(id, a);
+        }
+        return accepted;
+    }
+
+    public Solution ToSolution() => new Solution
+    {
+        Score = _score, Label = _p.ToString(),
+        DataMappings = _assign.SelectMany(kv => kv.Value.Data.Select(d => (d, kv.Key))
+            .Concat(kv.Value.Sources.SelectMany(s => s.data.Select(d => (d, s.src))))).ToList(),
+        ModelMappings = _assign.SelectMany(kv => kv.Value.Sources.Select(s => (s.src, kv.Key))).ToList()
+    };
 
     double[]? _srcCost;   // mode lagrangien : coût d'utiliser chaque modèle comme source
 
@@ -583,24 +674,9 @@ public sealed class Solver
             for (int t = 0; t < 4; t++)
                 _sourceCandidates[t] = monos[t].OrderBy(m => _srcCost[m.Id]).Select(m => m.Id).ToList();
         }
-        var order = prio.OrderByDescending(kv => kv.Value.score).ToArray();
-
-        long score = 0;
-        foreach (var (id, (_, direct)) in order)
-        {
-            if (_used[id]) continue;
-            var m = _inst.Models[id];
-            if (m.Cost > _energyLeft) continue;
-            long g;
-            if (direct && TryFullFree(m, out g)) { score += g; continue; }
-            if (TryHalf(m, out g)) score += g;
-        }
-        return new Solution
-        {
-            Score = score, Label = _p.ToString(),
-            DataMappings = new List<(int, int)>(_dataMap),
-            ModelMappings = new List<(int, int)>(_modelMap)
-        };
+        _order = prio.OrderByDescending(kv => kv.Value.score).Select(kv => (kv.Key, kv.Value.direct)).ToArray();
+        InsertPass(null);
+        return ToSolution();
     }
 
     static double Gauss(Random r)
@@ -720,7 +796,7 @@ public static class Program
             int seed = 1;
             Parallel.For(0, Environment.ProcessorCount, _ =>
             {
-                while (sw.Elapsed.TotalSeconds < timeLimit)
+                while (sw.Elapsed.TotalSeconds < timeLimit * 0.4)
                 {
                     Params p;
                     lock (lockObj)
@@ -742,6 +818,20 @@ public static class Program
                         if (sol.Score > best.Score) { best = sol; bestP = p; }
                 }
             });
+
+            // Phase 3 : recherche locale (détruire / reconstruire) depuis la meilleure configuration.
+            long beforeLns = best.Score;
+            int threads = Environment.ProcessorCount;
+            var lns = new Solution[threads];
+            Parallel.For(0, threads, i =>
+            {
+                var solver = new Solver(inst, bestP);
+                solver.Run();
+                solver.Improve(() => sw.Elapsed.TotalSeconds < timeLimit, new Random(1000 + i), 2 + 2 * i);
+                lns[i] = solver.ToSolution();
+            });
+            foreach (var l in lns) if (l.Score > best.Score) best = l;
+            Console.WriteLine($"{name,-12} recherche locale : {beforeLns} -> {best.Score}");
 
             var (check, err) = Checker.Evaluate(inst, best);
             string outPath = Path.Combine(outDir, name + "_submission.json");

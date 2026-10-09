@@ -34,7 +34,7 @@ Pièges repérés : des modèles avec `upperBound` négatif (impossibles), des m
 2. **Construction gloutonne** dans l'ordre des profits réduits : remplissage 100 % libre pour viser la valeur pleine, sinon copyright d'abord, et sources quand un jeton coûte moins cher que les données.
 3. **Remplissage d'un besoin** : gros datasets d'abord, puis on termine par un ou deux datasets qui tombent pile dans l'intervalle (indispensable pour 4_precise).
 4. **Besoins impossibles** (borne sup négative) : couverts par une source, ce que le vérificateur accepte.
-5. Grille de paramètres puis recherche aléatoire autour du meilleur réglage jusqu'à la limite de temps (`--time`). Une solution n'est écrite que si elle bat celle déjà présente.
+5. Grille de paramètres, recherche aléatoire autour du meilleur réglage (40 % du temps), puis recherche locale « détruire / reconstruire » jusqu'à la limite (`--time`). Une solution n'est écrite que si elle bat celle déjà présente.
 
 ## Scores (validés par test_solution.py, 2026-10-09)
 | Entrée | Score | Meilleur du classement |
@@ -43,8 +43,8 @@ Pièges repérés : des modèles avec `upperBound` négatif (impossibles), des m
 | 2_medium | 271 544 | 272 308 |
 | 3_free | 523 684 | 523 758 |
 | 4_precise | 1 030 782 | 1 031 935 |
-| 5_energy | 3 761 990 | 3 785 898 |
-| 6_shortage | 659 450 | 669 603 |
+| 5_energy | 3 762 342 | 3 785 898 |
+| 6_shortage | 659 719 | 669 603 |
 | 7_big | 5 820 862 | 5 822 471 |
 
 1_example a été résolu à la main (source 0 vers le modèle 1).
