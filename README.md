@@ -29,32 +29,31 @@
 
 Pièges repérés : des modèles avec `upperBound` négatif (impossibles), des modèles à coût énergie = 1 (quasi gratuits), des valeurs à 0, et des mono-types avec `lowerBound` = 1 (sources très bon marché en données).
 
-## Approche (v2)
-1. **Prix lagrangiens** : un sous-gradient multiplicatif fixe un prix pour l'énergie, les données libres, les données totales (par type) et un "jeton source" par type. Chaque modèle choisit seul entre rien, valeur pleine, valeur/2 ou source ; les prix s'ajustent jusqu'à respecter les capacités.
-2. **Construction gloutonne** dans l'ordre des profits réduits : remplissage 100 % libre pour viser la valeur pleine, sinon copyright d'abord, et sources quand un jeton coûte moins cher que les données.
-3. **Remplissage d'un besoin** : gros datasets d'abord, puis on termine par un ou deux datasets qui tombent pile dans l'intervalle (indispensable pour 4_precise).
+## Approche (v4)
+1. **Relaxation linéaire** (OR-Tools GLOP) : pour chaque modèle, valeur pleine, valeur/2 ou source ; contraintes d'énergie, de volume libre et total par type, et de jetons source par type. Elle donne une borne supérieure (très proche des meilleurs scores du classement), les modèles à entraîner et les prix duaux des ressources.
+2. **Appariement global datasets → sources** : chaque source retenue par le LP reçoit à l'avance un seul dataset dont la taille tombe dans son intervalle (sources triées par borne sup, plus petit dataset suffisant). Le volume gaspillé sur 6_shortage passe de 490 k à 288 k.
+3. **Construction gloutonne** guidée par le LP : valeur pleine avec datasets libres, sinon copyright d'abord, sources pour les besoins que le LP couvre par jeton. Fin de remplissage par un dataset ou une paire avec un surplus toléré réglable.
 4. **Besoins impossibles** (borne sup négative) : couverts par une source, ce que le vérificateur accepte.
-5. Grille de paramètres, recherche aléatoire autour du meilleur réglage (40 % du temps), puis recherche locale « détruire / reconstruire » jusqu'à la limite (`--time`). Une solution n'est écrite que si elle bat celle déjà présente.
+5. Prix lagrangiens par sous-gradient comme alternative, grille de paramètres, recherche aléatoire, puis recherche locale « détruire / reconstruire » jusqu'à la limite (`--time`). Une solution n'est écrite que si elle bat celle déjà présente.
 
 ## Scores (validés par test_solution.py, 2026-10-09)
-| Entrée | Score | Meilleur du classement |
-|---|---|---|
-| 1_example | 12 946 | 12 946 |
-| 2_medium | 271 544 | 272 308 |
-| 3_free | 523 684 | 523 758 |
-| 4_precise | 1 030 782 | 1 031 935 |
-| 5_energy | 3 762 342 | 3 785 898 |
-| 6_shortage | 659 719 | 669 603 |
-| 7_big | 5 820 862 | 5 822 471 |
+| Entrée | Score | Borne LP | Meilleur du classement |
+|---|---|---|---|
+| 1_example | 12 946 | - | 12 946 |
+| 2_medium | 272 014 | 272 491 | 272 308 |
+| 3_free | 523 698 | 523 761 | 523 758 |
+| 4_precise | 1 031 623 | 1 031 992 | 1 031 935 |
+| 5_energy | 3 773 272 | 3 788 025 | 3 785 898 |
+| 6_shortage | 664 040 | 671 259 | 669 603 |
+| 7_big | 5 820 962 | 5 824 402 | 5 822 471 |
 
-1_example a été résolu à la main (source 0 vers le modèle 1).
+1_example a été résolu à la main (source 0 vers le modèle 1). Le LP de 7_big prend environ 3 min.
 
 ## Pistes restantes
-- 6_shortage et 5_energy : meilleure affectation des petits datasets aux sources (appariement), recherche locale.
-- Recherche locale générale : échanger un modèle retenu contre un exclu.
+- 6_shortage : il reste environ 1,1 % de volume gaspillé ; choisir les sources en fonction des petits datasets disponibles (et pas seulement celles du LP).
 
 ## Utilisation
 ```
-dotnet run -c Release -- <dossier datasets> --out <dossier solutions> --time 60
+dotnet run -c Release -- <dossier datasets> --out <dossier solutions> --time 150   (--no-lp pour désactiver le LP)
 ```
 Sous Visual Studio : ouvrir `IsogradIA.sln`, et dans Propriétés > Déboguer, mettre en arguments le chemin du dossier `datasets`.

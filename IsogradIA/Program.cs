@@ -132,9 +132,17 @@ public sealed class Params
     public double Noise;            // bruit multiplicatif sur les priorités (recherche aléatoire)
     public int Seed;
     public int PairTries = 300;     // nombre de candidats essayés pour finir avec une paire
+    public bool MinWaste;           // finir un besoin avec le minimum de surplus (seul ou paire)
+    public int WasteTolerance = 0;  // surplus accepté sans chercher mieux
+    public int SourceLookahead = 1; // nombre de sources comparées sur leur gaspillage réel
+    public bool ReserveSources;     // appariement global datasets -> sources avant la construction
+    public double ReserveThreshold = 0.5;
+    public int FreePenalty = 300;   // surcoût (en taille) d'un dataset libre réservé à une source
     public Prices? Prices;          // si renseigné : tri par profit réduit lagrangien
+    public LpGuide? Lp;             // si renseigné : construction guidée par la relaxation linéaire
+    public double LpWeight = 1;     // poids du guide LP face au profit réduit
     public override string ToString() =>
-        (Prices != null ? "lagrange " : "") + $"lambdaFree={LambdaFree:G3} lambdaCopy={LambdaCopy:G3} sources={Sources} q={SrcQuantile:G2} noise={Noise:G2} seed={Seed}";
+        (Lp != null ? $"lp(w={LpWeight:G2} look={SourceLookahead} tol={(MinWaste ? WasteTolerance : -1)}{(ReserveSources ? $" réserve fp={FreePenalty}" : "")}) " : Prices != null ? "lagrange " : "") + $"lambdaFree={LambdaFree:G3} lambdaCopy={LambdaCopy:G3} sources={Sources} q={SrcQuantile:G2} noise={Noise:G2} seed={Seed}";
 }
 
 /// Prix (multiplicateurs de Lagrange) des ressources, par unité de capacité totale.
@@ -337,19 +345,28 @@ public sealed class Solver
             int lo = lb - sum, hi = ub - sum;
             if (lo <= 0) return true;
 
-            // Un seul dataset suffit-il pour finir ? On prend le plus petit qui convient.
-            foreach (int c in classes)
-            {
-                long key = _pools.MinInRange(t, c, lo, hi);
-                if (key != 0) { Take(t, c, key, taken); return true; }
-            }
-
             int maxSize = 0;
             foreach (int c in classes) maxSize = Math.Max(maxSize, Pools.SizeOf(_pools.MaxAtMost(t, c, int.MaxValue / 2)));
             if (maxSize == 0) return false;
 
-            // Proche du but : on cherche une paire (a, b) avec a + b dans [lo, hi].
-            if (lo <= 2 * maxSize && TryPair(t, lo, hi, classes, taken)) return true;
+            if (_p.MinWaste)
+            {
+                // Fin du remplissage avec le minimum de surplus au-delà du minimum (le volume est la ressource rare).
+                // On épuise d'abord le pool préféré avant d'autoriser le suivant (les libres restent aux valeurs pleines).
+                for (int n = 1; n <= classes.Length; n++)
+                    if (FinishMinWaste(t, lo, hi, classes[..n], taken, maxSize)) return true;
+            }
+            else
+            {
+                // Un seul dataset suffit-il pour finir ? On prend le plus petit qui convient.
+                foreach (int c in classes)
+                {
+                    long key = _pools.MinInRange(t, c, lo, hi);
+                    if (key != 0) { Take(t, c, key, taken); return true; }
+                }
+                // Proche du but : on cherche une paire (a, b) avec a + b dans [lo, hi].
+                if (lo <= 2 * maxSize && TryPair(t, lo, hi, classes, taken, int.MaxValue, firstFound: true)) return true;
+            }
 
             // Sinon on prend le plus gros dataset qui ne fait pas encore atteindre le minimum.
             long best = 0; int bestC = -1;
@@ -365,8 +382,26 @@ public sealed class Solver
         return false;
     }
 
-    bool TryPair(int t, int lo, int hi, int[] classes, List<(int data, long key, int c)> taken)
+    /// Cherche une paire (a, b) avec a + b dans [lo, hi] et un surplus strictement inférieur à beatWaste.
+    bool FinishMinWaste(int t, int lo, int hi, int[] classes, List<(int data, long key, int c)> taken, int maxSize)
     {
+        long single = 0; int singleC = -1, singleWaste = int.MaxValue;
+        foreach (int c in classes)
+        {
+            long key = _pools.MinInRange(t, c, lo, hi);
+            if (key != 0 && Pools.SizeOf(key) - lo < singleWaste) { single = key; singleC = c; singleWaste = Pools.SizeOf(key) - lo; }
+        }
+        if (single != 0 && singleWaste <= _p.WasteTolerance) { Take(t, singleC, single, taken); return true; }
+        if (lo <= 2 * maxSize && TryPair(t, lo, hi, classes, taken, single != 0 ? singleWaste : int.MaxValue, firstFound: false)) return true;
+        if (single != 0) { Take(t, singleC, single, taken); return true; }
+        return false;
+    }
+
+    /// Cherche une paire (a, b) avec a + b dans [lo, hi] et un surplus strictement inférieur à beatWaste
+    /// (la première trouvée si firstFound, sinon la meilleure parmi les candidats examinés).
+    bool TryPair(int t, int lo, int hi, int[] classes, List<(int data, long key, int c)> taken, int beatWaste, bool firstFound)
+    {
+        long bestA = 0, bestB = 0; int bestCa = -1, bestCb = -1, bestW = beatWaste;
         foreach (int ca in classes)
         {
             foreach (long a in _pools.Descending(t, ca, lo - 1, _p.PairTries))
@@ -377,18 +412,20 @@ public sealed class Solver
                 foreach (int cb in classes)
                 {
                     long b = _pools.MinInRange(t, cb, lo - sa, hi - sa);
-                    if (b != 0)
-                    {
-                        _pools.Add(t, ca, a);
-                        Take(t, ca, a, taken);
-                        Take(t, cb, b, taken);
-                        return true;
-                    }
+                    if (b == 0) continue;
+                    int w = sa + Pools.SizeOf(b) - lo;
+                    if (w < bestW) { bestW = w; bestA = a; bestB = b; bestCa = ca; bestCb = cb; }
+                    if (firstFound) break;
                 }
                 _pools.Add(t, ca, a);
+                if (bestA != 0 && (firstFound || bestW <= _p.WasteTolerance)) break;
             }
+            if (bestA != 0 && (firstFound || bestW <= _p.WasteTolerance)) break;
         }
-        return false;
+        if (bestA == 0) return false;
+        Take(t, bestCa, bestA, taken);
+        Take(t, bestCb, bestB, taken);
+        return true;
     }
 
     void Take(int t, int c, long key, List<(int data, long key, int c)> taken)
@@ -427,14 +464,49 @@ public sealed class Solver
         var list = _sourceCandidates[t];
         PeekSource(t);
         int tries = 0;
-        for (int i = _sourcePtr[t]; i < list.Count && tries < 40; i++)
+        IEnumerable<int> candidates = Enumerable.Range(_sourcePtr[t], list.Count - _sourcePtr[t]);
+        if (_p.SourceLookahead > 1)
         {
+            // Appariement : parmi les prochaines sources, on préfère celle dont le dataset réel gaspille le moins.
+            var scored = new List<(int i, double cost)>();
+            for (int i = _sourcePtr[t]; i < list.Count && scored.Count < _p.SourceLookahead; i++)
+            {
+                var s = _inst.Models[list[i]];
+                if (_used[s.Id] || s.Cost > energyBudget) continue;
+                double baseCost = _srcCost != null ? _srcCost[s.Id] : SourceWeight(s);
+                int vol = s.Lb[0];
+                long key = 0;
+                foreach (int c in CopyFirst)
+                {
+                    long k2 = _pools.MinInRange(t, c, s.Lb[0], s.Ub[0]);
+                    if (k2 != 0 && (key == 0 || k2 / 1_000_000 < key / 1_000_000)) key = k2;
+                }
+                if (key != 0) vol = Pools.SizeOf(key);
+                scored.Add((i, baseCost + ReqCost(t, vol) - ReqCost(t, s.Lb[0])));
+            }
+            candidates = scored.OrderBy(x => x.cost).Select(x => x.i).Concat(candidates);
+        }
+        foreach (int i in candidates)
+        {
+            if (tries >= 40) break;
             var s = _inst.Models[list[i]];
             if (_used[s.Id]) continue;
             if (s.Cost > energyBudget) continue;
             tries++;
             var taken = new List<(int, long, int)>();
             int mark = _journal.Count;
+            if (_reserved != null && _reserved[s.Id] != 0)
+            {
+                // Dataset réservé à l'avance par l'appariement global : on le prend directement.
+                long key = _reserved[s.Id];
+                _reserved[s.Id] = 0;
+                int c = _inst.Datasets[Pools.IdOf(key)].Copy ? 1 : 0;
+                _pools.Add(t, c, key);
+                Take(t, c, key, taken);
+                _used[s.Id] = true;
+                foreach (var (d, _, _) in taken) dataOut.Add((d, s.Id));
+                return s.Id;
+            }
             // La valeur d'une source n'est pas comptée : le copyright n'a pas d'importance.
             if (FillRequirement(t, s.Lb[0], s.Ub[0], CopyFirst, taken))
             {
@@ -475,7 +547,8 @@ public sealed class Solver
         for (int k = 0; k < m.Types.Length && ok; k++)
         {
             int t = m.Types[k];
-            bool sourceFirst = !m.ReqOk(k) || (_p.Sources && PeekSource(t) < ReqCost(t, m.Lb[k]));
+            bool sourceFirst = !m.ReqOk(k) || (_p.Sources &&
+                (_p.Lp != null && _p.Lp.Xh[m.Id] > 0.01 ? _p.Lp.TokenReq[m.Id][k] : PeekSource(t) < ReqCost(t, m.Lb[k])));
             bool done = false;
             for (int attempt = 0; attempt < 2 && !done; attempt++)
             {
@@ -596,23 +669,54 @@ public sealed class Solver
 
     public Solution ToSolution() => new Solution
     {
-        Score = _score, Label = _p.ToString(),
+        Score = _score, Label = _p.ToString() + (Environment.GetEnvironmentVariable("ISOGRAD_VERBOSE") == "1" ? $" order[{string.Join(",", _order.Take(5).Select(o => o.id))}] n={_order.Length}" : ""),
         DataMappings = _assign.SelectMany(kv => kv.Value.Data.Select(d => (d, kv.Key))
             .Concat(kv.Value.Sources.SelectMany(s => s.data.Select(d => (d, s.src))))).ToList(),
         ModelMappings = _assign.SelectMany(kv => kv.Value.Sources.Select(s => (s.src, kv.Key))).ToList()
     };
 
     double[]? _srcCost;   // mode lagrangien : coût d'utiliser chaque modèle comme source
+    long[]? _reserved;    // dataset réservé (clé) pour chaque source choisie par le LP
+
+    /// Appariement global datasets -> sources : chaque source retenue par le LP reçoit un seul dataset
+    /// dont la taille tombe dans son intervalle. Sources triées par borne sup croissante et plus petit
+    /// dataset suffisant (appariement intervalles/points), ce qui laisse les petits datasets aux petites sources.
+    void ReserveSourceDatasets(LpGuide lp)
+    {
+        _reserved = new long[_inst.Models.Length];
+        for (int t = 0; t < 4; t++)
+        {
+            var srcs = _sourceCandidates[t].Select(id => _inst.Models[id])
+                .Where(m => lp.Xs[m.Id] >= _p.ReserveThreshold)
+                .OrderBy(m => m.Ub[0]).ThenByDescending(m => m.Lb[0]);
+            foreach (var m in srcs)
+            {
+                long best = 0; int bestC = -1;
+                foreach (int c in CopyFirst)
+                {
+                    long key = _pools.MinInRange(t, c, m.Lb[0], m.Ub[0]);
+                    if (key == 0) continue;
+                    if (best == 0 || Pools.SizeOf(key) + (c == 0 ? _p.FreePenalty : 0) < Pools.SizeOf(best) + (bestC == 0 ? _p.FreePenalty : 0))
+                    { best = key; bestC = c; }
+                }
+                if (best == 0) continue;
+                _pools.Remove(t, bestC, best);
+                _reserved[m.Id] = best;
+            }
+        }
+    }
+    Prices? _pr;          // prix utilisés (sous-gradient ou duaux du LP)
 
     /// Coût (dans les unités du mode courant) d'un besoin rempli directement avec des datasets.
-    double ReqCost(int t, int lb) => _p.Prices is { } pr
+    double ReqCost(int t, int lb) => _pr is { } pr
         ? pr.Total[t] * Math.Max(lb, 0) / Math.Max(1.0, _inst.Supply[t])
         : DataW(t, lb);
 
     public Solution Run()
     {
         var rng = new Random(_p.Seed);
-        var pr = _p.Prices;
+        var pr = _pr = _p.Prices ?? _p.Lp?.Duals;
+        var lp = _p.Lp;
         var prio = new Dictionary<int, (double score, bool direct)>();
         var monos = Enumerable.Range(0, 4).Select(t => !_p.Sources ? new List<Model>() :
             _inst.Models.Where(m => m.AllReqOk && m.IsMono && m.Types[0] == t).ToList()).ToArray();
@@ -666,16 +770,39 @@ public sealed class Solver
                     double own = pr.Energy * EnergyW(m.Cost) + ReqCost(m.Types[0], m.Lb[0]);
                     _srcCost[m.Id] = own + Math.Max(0, best);
                     // Modèle plus utile comme source que comme cible : on ne l'entraîne pas pour lui-même.
-                    if (pr.Token[m.Types[0]] - own > Math.Max(0, best)) continue;
+                    if (lp != null ? lp.Xs[m.Id] >= 0.5 : pr.Token[m.Types[0]] - own > Math.Max(0, best)) continue;
                 }
                 if (m.Value <= 0 || double.IsNegativeInfinity(best)) continue;
-                prio[m.Id] = (best + _p.Noise * 100 * Gauss(rng), pf >= ph);
+                if (lp != null)
+                {
+                    // Guide LP : d'abord les modèles que la relaxation entraîne, dans le mode qu'elle a choisi.
+                    double x = lp.Xf[m.Id] + lp.Xh[m.Id];
+                    bool dir = x > 0.01 ? lp.Xf[m.Id] >= lp.Xh[m.Id] : pf >= ph;
+                    prio[m.Id] = (x * _p.LpWeight * 1000 + best + _p.Noise * 100 * Gauss(rng), dir);
+                }
+                else prio[m.Id] = (best + _p.Noise * 100 * Gauss(rng), pf >= ph);
             }
             for (int t = 0; t < 4; t++)
-                _sourceCandidates[t] = monos[t].OrderBy(m => _srcCost[m.Id]).Select(m => m.Id).ToList();
+                _sourceCandidates[t] = (lp != null
+                    ? monos[t].OrderByDescending(m => Math.Round(lp.Xs[m.Id], 1)).ThenBy(m => _srcCost[m.Id])
+                    : monos[t].OrderBy(m => _srcCost[m.Id])).Select(m => m.Id).ToList();
         }
         _order = prio.OrderByDescending(kv => kv.Value.score).Select(kv => (kv.Key, kv.Value.direct)).ToArray();
+        if (lp != null && _p.ReserveSources) ReserveSourceDatasets(lp);
         InsertPass(null);
+        if (_reserved != null)
+        {
+            // Réservations non utilisées : on rend les datasets et on refait une passe.
+            for (int id = 0; id < _reserved.Length; id++)
+                if (_reserved[id] != 0)
+                {
+                    long key = _reserved[id];
+                    var d = _inst.Datasets[Pools.IdOf(key)];
+                    _pools.Add(d.Type, d.Copy ? 1 : 0, key);
+                    _reserved[id] = 0;
+                }
+            InsertPass(null);
+        }
         return ToSolution();
     }
 
@@ -746,10 +873,12 @@ public static class Program
         // Usage : IsogradIA <dossier datasets ou fichiers .json> [--out dossier] [--time secondes]
         string outDir = "solutions";
         double timeLimit = 30;
+        bool useLp = true;
         var inputs = new List<string>();
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--out") outDir = args[++i];
+            else if (args[i] == "--no-lp") useLp = false;
             else if (args[i] == "--time") timeLimit = double.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture);
             else if (Directory.Exists(args[i])) inputs.AddRange(Directory.GetFiles(args[i], "*.json").OrderBy(f => f));
             else inputs.Add(args[i]);
@@ -785,8 +914,25 @@ public static class Program
                                 Token = prices.Token.Select(x => x * tk).ToArray() }
                         });
             }
+            if (useLp)
+            {
+                var lsw = Stopwatch.StartNew();
+                var lp = LpGuide.Solve(inst);
+                Console.WriteLine($"{name,-12} borne LP = {lp.Bound:F0} ({lsw.Elapsed.TotalSeconds:F1}s)");
+                if (Environment.GetEnvironmentVariable("ISOGRAD_VERBOSE") == "1")
+                    Console.WriteLine($"   xf={lp.Xf.Sum():F0} xh={lp.Xh.Sum():F0} xs={lp.Xs.Sum():F0} prixE={lp.Duals.Energy:G4} total=[{string.Join(",", lp.Duals.Total.Select(x => x.ToString("G4")))}] libre=[{string.Join(",", lp.Duals.Free.Select(x => x.ToString("G4")))}] jeton=[{string.Join(",", lp.Duals.Token.Select(x => x.ToString("G4")))}]");
+                foreach (bool reserve in new[] { false, true })
+                    foreach (int look in new[] { 1, 10 })
+                        foreach (int tol in new[] { -1, 100, 200, 400 })
+                            foreach (int fp in reserve ? new[] { 0, 300, 3000 } : new[] { 300 })
+                                configs.Add(new Params { Sources = true, Lp = lp, LpWeight = 1, SourceLookahead = look,
+                                    WasteTolerance = Math.Max(tol, 0), MinWaste = tol >= 0, ReserveSources = reserve, FreePenalty = fp });
+            }
             var results = new Solution[configs.Count];
             Parallel.For(0, configs.Count, i => results[i] = new Solver(inst, configs[i]).Run());
+            if (Environment.GetEnvironmentVariable("ISOGRAD_VERBOSE") == "1")
+                for (int i = 0; i < configs.Count; i++)
+                    if (configs[i].Lp != null || configs[i].Prices != null) Console.WriteLine($"   {results[i].Score,10}  src={results[i].ModelMappings.Count} data={results[i].DataMappings.Count}  {results[i].Label}");
             int bi = Enumerable.Range(0, configs.Count).MaxBy(i => results[i].Score);
             var best = results[bi]; var bestP = configs[bi];
             long gridScore = best.Score;
@@ -810,6 +956,13 @@ public static class Program
                             SrcQuantile = Math.Clamp(bestP.SrcQuantile * Math.Exp(0.5 * (r.NextDouble() * 2 - 1)), 0.001, 0.9),
                             Noise = 0.1 * r.NextDouble() * r.NextDouble(),
                             Prices = bestP.Prices?.Scaled(r, 0.15),
+                            Lp = bestP.Lp,
+                            LpWeight = Math.Max(0.01, bestP.LpWeight * Math.Exp(0.5 * (r.NextDouble() * 2 - 1))),
+                            SourceLookahead = bestP.SourceLookahead,
+                            WasteTolerance = bestP.WasteTolerance,
+                            MinWaste = bestP.MinWaste,
+                            ReserveSources = bestP.ReserveSources,
+                            FreePenalty = bestP.FreePenalty,
                             Seed = seed++
                         };
                     }
