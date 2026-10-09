@@ -18,7 +18,10 @@ public sealed class Model
     public int[] Types = Array.Empty<int>(); // 0=n 1=t 2=i 3=c
     public int[] Lb = Array.Empty<int>();
     public int[] Ub = Array.Empty<int>();
-    public bool Feasible => Lb.Length > 0 && Lb.Zip(Ub).All(p => p.First <= p.Second && p.Second > 0);
+    public bool ReqOk(int k) => Lb[k] <= Ub[k] && Ub[k] > 0;
+    // Tous les besoins sont réalisables avec des datasets. Sinon, un besoin impossible
+    // (borne sup négative...) peut quand même être couvert par une source : le vérificateur ne le contrôle pas.
+    public bool AllReqOk => Lb.Length > 0 && Enumerable.Range(0, Lb.Length).All(ReqOk);
     public bool IsMono => Types.Length == 1;
 }
 
@@ -36,6 +39,7 @@ public sealed class Instance
     public Model[] Models = Array.Empty<Model>();
     public DataSet[] Datasets = Array.Empty<DataSet>();
     public long[] Supply = new long[4];
+    public long[] FreeSupply = new long[4];
 
     public static int TypeIndex(string s) => "ntic".IndexOf(s[0]);
 
@@ -76,7 +80,11 @@ public sealed class Instance
         }
         inst.Models = models.OrderBy(m => m.Id).ToArray();
         inst.Datasets = datasets.OrderBy(d => d.Id).ToArray();
-        foreach (var d in inst.Datasets) inst.Supply[d.Type] += d.Size;
+        foreach (var d in inst.Datasets)
+        {
+            inst.Supply[d.Type] += d.Size;
+            if (!d.Copy) inst.FreeSupply[d.Type] += d.Size;
+        }
         return inst;
     }
 }
@@ -87,6 +95,21 @@ public sealed class Solution
     public string Label = "";
     public List<(int data, int model)> DataMappings = new();
     public List<(int source, int target)> ModelMappings = new();
+
+    public static Solution FromJson(string json)
+    {
+        var sol = new Solution();
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            foreach (var p in doc.RootElement.GetProperty("dataMappings").EnumerateArray())
+                sol.DataMappings.Add((p[0].GetInt32(), p[1].GetInt32()));
+            foreach (var p in doc.RootElement.GetProperty("modelMappings").EnumerateArray())
+                sol.ModelMappings.Add((p[0].GetInt32(), p[1].GetInt32()));
+        }
+        catch (Exception) { return new Solution(); }
+        return sol;
+    }
 
     public string ToJson()
     {
@@ -100,14 +123,96 @@ public sealed class Solution
     }
 }
 
-public enum SourceMode { None, Fallback, Prefer }
-
 public sealed class Params
 {
-    public double Lambda;           // poids des données dans le coût d'un modèle
-    public SourceMode Sources;
-    public bool FreeFirst = true;   // tenter d'abord un remplissage 100% libre de droits
-    public override string ToString() => $"lambda={Lambda} sources={Sources} freeFirst={FreeFirst}";
+    public double LambdaFree;       // poids des données libres de droits (relatif à l'énergie)
+    public double LambdaCopy;       // poids des données sous copyright (relatif à l'énergie)
+    public bool Sources = true;     // autoriser les modèles mono-type comme sources
+    public double SrcQuantile;      // quantile des sources utilisé pour estimer leur coût
+    public double Noise;            // bruit multiplicatif sur les priorités (recherche aléatoire)
+    public int Seed;
+    public int PairTries = 300;     // nombre de candidats essayés pour finir avec une paire
+    public Prices? Prices;          // si renseigné : tri par profit réduit lagrangien
+    public override string ToString() =>
+        (Prices != null ? "lagrange " : "") + $"lambdaFree={LambdaFree:G3} lambdaCopy={LambdaCopy:G3} sources={Sources} q={SrcQuantile:G2} noise={Noise:G2} seed={Seed}";
+}
+
+/// Prix (multiplicateurs de Lagrange) des ressources, par unité de capacité totale.
+public sealed class Prices
+{
+    public double Energy;
+    public double[] Free = new double[4];
+    public double[] Total = new double[4];
+    public double[] Token = new double[4];   // prix d'un besoin couvert par une source
+
+    public Prices Scaled(Random r, double sigma)
+    {
+        double f() => Math.Exp(sigma * (r.NextDouble() * 2 - 1));
+        return new Prices { Energy = Energy * f(), Free = Free.Select(x => x * f()).ToArray(), Total = Total.Select(x => x * f()).ToArray(), Token = Token.Select(x => x * f()).ToArray() };
+    }
+
+    /// Sous-gradient multiplicatif sur la relaxation : chaque modèle choisit seul entre rien,
+    /// valeur pleine (données libres), valeur/2 (besoins en données ou en jetons source) et source.
+    public static Prices Compute(Instance inst, bool sources, int iterations = 3000)
+    {
+        var ms = inst.Models.Where(m => m.Lb.Length > 0).ToArray();
+        int n = ms.Length;
+        var e = ms.Select(m => (double)m.Cost / inst.EnergyCap).ToArray();
+        var reqs = ms.Select(m => Enumerable.Range(0, m.Lb.Length).Select(k => (
+            t: m.Types[k],
+            tot: (double)Math.Max(m.Lb[k], 0) / Math.Max(1, inst.Supply[m.Types[k]]),
+            fre: inst.FreeSupply[m.Types[k]] > 0 ? (double)Math.Max(m.Lb[k], 0) / inst.FreeSupply[m.Types[k]] : 1e9,
+            ok: m.ReqOk(k))).ToArray()).ToArray();
+        var hasSrc = new bool[4];
+        foreach (var m in ms) if (sources && m.IsMono && m.AllReqOk) hasSrc[m.Types[0]] = true;
+
+        // Prix initial de l'énergie : ratio valeur/énergie marginal du sac à dos fractionnaire.
+        var byRatio = Enumerable.Range(0, n).Where(j => ms[j].Value > 0).OrderByDescending(j => ms[j].Value / Math.Max(e[j], 1e-18)).ToArray();
+        double acc = 0, pe = 0;
+        foreach (int j in byRatio) { acc += e[j]; pe = ms[j].Value / Math.Max(e[j], 1e-18); if (acc >= 1) break; }
+        var p = new Prices { Energy = pe };
+        double avgV = ms.Average(m => (double)m.Value);
+        for (int t = 0; t < 4; t++) { p.Free[t] = pe * 0.05; p.Total[t] = pe * 0.05; p.Token[t] = hasSrc[t] ? avgV * 0.2 : 1e18; }
+        double floor = pe * 1e-6;
+
+        for (int it = 0; it < iterations; it++)
+        {
+            double eta = 0.3 * Math.Pow(0.003 / 0.3, (double)it / iterations);
+            double ue = 0; var uf = new double[4]; var ut = new double[4]; var dem = new double[4]; var sup = new double[4];
+            for (int j = 0; j < n; j++)
+            {
+                var m = ms[j];
+                double ce = p.Energy * e[j];
+                double pf = m.AllReqOk && m.Value > 0 ? m.Value - ce : double.NegativeInfinity;
+                double ph = m.Value > 0 ? m.Value / 2.0 - ce : double.NegativeInfinity;
+                foreach (var r in reqs[j])
+                {
+                    double dt = p.Total[r.t] * r.tot;
+                    pf -= dt + p.Free[r.t] * r.fre;
+                    ph -= r.ok ? Math.Min(dt, p.Token[r.t]) : p.Token[r.t];
+                }
+                double ps = hasSrc[m.Types[0]] && m.IsMono && m.AllReqOk ? p.Token[m.Types[0]] - ce - p.Total[m.Types[0]] * reqs[j][0].tot : double.NegativeInfinity;
+                double best = Math.Max(Math.Max(pf, ph), ps);
+                if (best <= 0) continue;
+                ue += e[j];
+                if (best == ps) { sup[m.Types[0]] += 1; ut[m.Types[0]] += reqs[j][0].tot; }
+                else if (best == pf) foreach (var r in reqs[j]) { ut[r.t] += r.tot; uf[r.t] += r.fre; }
+                else foreach (var r in reqs[j])
+                {
+                    if (r.ok && p.Total[r.t] * r.tot <= p.Token[r.t]) ut[r.t] += r.tot; else dem[r.t] += 1;
+                }
+            }
+            p.Energy = Math.Max(floor, p.Energy * Math.Exp(eta * Math.Clamp(ue - 1, -1, 1)));
+            for (int t = 0; t < 4; t++)
+            {
+                p.Free[t] = Math.Max(floor, p.Free[t] * Math.Exp(eta * Math.Clamp(uf[t] - 1, -1, 1)));
+                p.Total[t] = Math.Max(floor, p.Total[t] * Math.Exp(eta * Math.Clamp(ut[t] - 1, -1, 1)));
+                if (hasSrc[t])
+                    p.Token[t] = Math.Max(1e-3, p.Token[t] * Math.Exp(eta * Math.Clamp((dem[t] - sup[t]) / Math.Max(1, (dem[t] + sup[t]) / 2), -1, 1)));
+            }
+        }
+        return p;
+    }
 }
 
 /// Réserve de datasets disponibles, par type et par statut (0 = libre, 1 = copyright).
@@ -139,6 +244,19 @@ public sealed class Pools
         return s.GetViewBetween(lo * K, hi * K + K - 1).Min;
     }
 
+    /// Datasets de taille <= hi, du plus grand au plus petit (ne pas modifier le pool pendant l'itération).
+    public List<long> Descending(int t, int c, int hi, int max = 400)
+    {
+        var res = new List<long>();
+        if (hi < 1 || _sets[t, c].Count == 0) return res;
+        foreach (long k in _sets[t, c].GetViewBetween(0, hi * K + K - 1).Reverse())
+        {
+            res.Add(k);
+            if (res.Count >= max) break;
+        }
+        return res;
+    }
+
     /// Plus grand dataset de taille <= hi, 0 si aucun.
     public long MaxAtMost(int t, int c, int hi)
     {
@@ -161,6 +279,7 @@ public sealed class Solver
     readonly List<(int source, int target)> _modelMap = new();
     readonly List<int>[] _sourceCandidates = new List<int>[4];
     readonly int[] _sourcePtr = new int[4];
+    readonly double[] _srcEstimate = new double[4];
 
     public Solver(Instance inst, Params p)
     {
@@ -170,16 +289,36 @@ public sealed class Solver
         _used = new bool[inst.Models.Length];
     }
 
-    double Weight(Model m)
+    double EnergyW(long cost) => (double)cost / _inst.EnergyCap;
+    // Poids d'une quantité de données prise dans les datasets libres / sous copyright.
+    double FreeW(int t, int lb) => _p.LambdaFree * Math.Max(lb, 0) / Math.Max(1.0, _inst.FreeSupply[t]);
+    double DataW(int t, int lb) => _p.LambdaCopy * Math.Max(lb, 0) /
+        Math.Max(1.0, _inst.Supply[t] - _inst.FreeSupply[t] > 0 ? _inst.Supply[t] - _inst.FreeSupply[t] : _inst.Supply[t]);
+
+    /// Poids "ressources" d'un modèle entraîné uniquement avec des datasets.
+    double DirectWeight(Model m)
     {
-        double w = (double)m.Cost / _inst.EnergyCap;
-        for (int k = 0; k < m.Types.Length; k++)
-            w += _p.Lambda * Math.Max(m.Lb[k], 0) / Math.Max(1.0, _inst.Supply[m.Types[k]]);
+        if (!m.AllReqOk) return double.PositiveInfinity;
+        double w = EnergyW(m.Cost);
+        for (int k = 0; k < m.Types.Length; k++) w += FreeW(m.Types[k], m.Lb[k]);
         return w + 1e-15;
     }
 
+    /// Poids d'un modèle à valeur divisée par deux : chaque besoin prend le moins cher
+    /// entre datasets directs et une source estimée.
+    double HalfWeight(Model m)
+    {
+        double w = EnergyW(m.Cost);
+        for (int k = 0; k < m.Types.Length; k++)
+            w += m.ReqOk(k) ? Math.Min(DataW(m.Types[k], m.Lb[k]), _srcEstimate[m.Types[k]]) : _srcEstimate[m.Types[k]];
+        return w + 1e-15;
+    }
+
+    double SourceWeight(Model s) => EnergyW(s.Cost) + DataW(s.Types[0], s.Lb[0]);
+
     /// Remplit un besoin [lb, ub] du type t avec les pools indiqués (dans l'ordre de préférence).
-    /// En cas d'échec, l'état est laissé tel quel : l'appelant fait le rollback via le journal.
+    /// Gros datasets d'abord, puis on termine par un ou deux datasets qui tombent pile dans l'intervalle.
+    /// En cas d'échec, l'appelant fait le rollback via le journal.
     bool FillRequirement(int t, int lb, int ub, int[] classes, List<(int data, long key, int c)> taken)
     {
         if (ub < lb || ub <= 0) return false;
@@ -195,6 +334,14 @@ public sealed class Solver
                 long key = _pools.MinInRange(t, c, lo, hi);
                 if (key != 0) { Take(t, c, key, taken); return true; }
             }
+
+            int maxSize = 0;
+            foreach (int c in classes) maxSize = Math.Max(maxSize, Pools.SizeOf(_pools.MaxAtMost(t, c, int.MaxValue / 2)));
+            if (maxSize == 0) return false;
+
+            // Proche du but : on cherche une paire (a, b) avec a + b dans [lo, hi].
+            if (lo <= 2 * maxSize && TryPair(t, lo, hi, classes, taken)) return true;
+
             // Sinon on prend le plus gros dataset qui ne fait pas encore atteindre le minimum.
             long best = 0; int bestC = -1;
             foreach (int c in classes)
@@ -205,6 +352,32 @@ public sealed class Solver
             if (best == 0) return false;
             Take(t, bestC, best, taken);
             sum += Pools.SizeOf(best);
+        }
+        return false;
+    }
+
+    bool TryPair(int t, int lo, int hi, int[] classes, List<(int data, long key, int c)> taken)
+    {
+        foreach (int ca in classes)
+        {
+            foreach (long a in _pools.Descending(t, ca, lo - 1, _p.PairTries))
+            {
+                int sa = Pools.SizeOf(a);
+                if (2 * sa < lo) break; // b serait plus grand que a : paire déjà essayée
+                _pools.Remove(t, ca, a);
+                foreach (int cb in classes)
+                {
+                    long b = _pools.MinInRange(t, cb, lo - sa, hi - sa);
+                    if (b != 0)
+                    {
+                        _pools.Add(t, ca, a);
+                        Take(t, ca, a, taken);
+                        Take(t, cb, b, taken);
+                        return true;
+                    }
+                }
+                _pools.Add(t, ca, a);
+            }
         }
         return false;
     }
@@ -229,15 +402,28 @@ public sealed class Solver
     static readonly int[] FreeOnly = { 0 };
     static readonly int[] CopyFirst = { 1, 0 };
 
+    /// Poids de la prochaine source disponible du type t (infini s'il n'y en a plus).
+    double PeekSource(int t)
+    {
+        var list = _sourceCandidates[t];
+        while (_sourcePtr[t] < list.Count && _used[list[_sourcePtr[t]]]) _sourcePtr[t]++;
+        if (_sourcePtr[t] >= list.Count) return double.PositiveInfinity;
+        int id = list[_sourcePtr[t]];
+        return _srcCost != null ? _srcCost[id] : SourceWeight(_inst.Models[id]);
+    }
+
     /// Essaie d'entraîner un modèle mono-type comme source de données. Renvoie l'id ou -1.
     int TakeSource(int t, long energyBudget, List<(int data, int model)> dataOut)
     {
         var list = _sourceCandidates[t];
-        for (int i = _sourcePtr[t]; i < list.Count; i++)
+        PeekSource(t);
+        int tries = 0;
+        for (int i = _sourcePtr[t]; i < list.Count && tries < 40; i++)
         {
             var s = _inst.Models[list[i]];
-            if (_used[s.Id]) { if (i == _sourcePtr[t]) _sourcePtr[t]++; continue; }
+            if (_used[s.Id]) continue;
             if (s.Cost > energyBudget) continue;
+            tries++;
             var taken = new List<(int, long, int)>();
             int mark = _journal.Count;
             // La valeur d'une source n'est pas comptée : le copyright n'a pas d'importance.
@@ -248,83 +434,71 @@ public sealed class Solver
                 return s.Id;
             }
             Rollback(mark);
-            if (i >= _sourcePtr[t] + 50) break; // on ne cherche pas indéfiniment
         }
         return -1;
     }
 
-    bool TryTrain(Model m, out long gained)
+    bool TryFullFree(Model m, out long gained)
     {
         gained = 0;
-        if (m.Cost > _energyLeft) return false;
-
-        // 1) Tout en libre de droits, sans source : valeur pleine.
-        if (_p.FreeFirst && _p.Sources != SourceMode.Prefer)
-        {
-            int mark = _journal.Count;
-            var taken = new List<(int data, long key, int c)>();
-            bool ok = true;
-            for (int k = 0; k < m.Types.Length && ok; k++)
-                ok = FillRequirement(m.Types[k], m.Lb[k], m.Ub[k], FreeOnly, taken);
-            if (ok)
-            {
-                Commit(m, taken, new List<(int, int)>(), new List<(int, int)>());
-                gained = m.Value;
-                return true;
-            }
-            Rollback(mark);
-        }
-
-        // 2) Données mixtes et/ou sources : valeur divisée par deux (sauf si tout est libre).
-        {
-            int mark = _journal.Count;
-            var markUsed = new List<int>();
-            var taken = new List<(int data, long key, int c)>();
-            var srcData = new List<(int, int)>();
-            var srcMap = new List<(int, int)>();
-            long budget = _energyLeft - m.Cost;
-            bool ok = true;
-            _used[m.Id] = true; // un modèle ne peut pas être sa propre source
-            int[] classes = _p.FreeFirst ? CopyFirst : new[] { 0, 1 };
-            for (int k = 0; k < m.Types.Length && ok; k++)
-            {
-                int t = m.Types[k];
-                bool done = false;
-                if (_p.Sources == SourceMode.Prefer)
-                    done = TrySource(t, m, ref budget, srcData, srcMap, markUsed);
-                if (!done)
-                {
-                    int jm = _journal.Count; int tm = taken.Count;
-                    done = FillRequirement(t, m.Lb[k], m.Ub[k], classes, taken);
-                    if (!done) { Rollback(jm); taken.RemoveRange(tm, taken.Count - tm); }
-                }
-                if (!done && _p.Sources == SourceMode.Fallback)
-                    done = TrySource(t, m, ref budget, srcData, srcMap, markUsed);
-                ok = done;
-            }
-            if (ok)
-            {
-                bool halved = srcMap.Count > 0 || taken.Any(x => x.c == 1);
-                foreach (var (_, model) in srcMap) _energyLeft -= _inst.Models[model].Cost;
-                Commit(m, taken, srcData, srcMap);
-                gained = halved ? m.Value / 2 : m.Value;
-                return true;
-            }
-            Rollback(mark);
-            foreach (int id in markUsed) _used[id] = false;
-            _used[m.Id] = false;
-        }
-        return false;
+        int mark = _journal.Count;
+        var taken = new List<(int data, long key, int c)>();
+        bool ok = true;
+        for (int k = 0; k < m.Types.Length && ok; k++)
+            ok = FillRequirement(m.Types[k], m.Lb[k], m.Ub[k], FreeOnly, taken);
+        if (!ok) { Rollback(mark); return false; }
+        Commit(m, taken, new List<(int, int)>(), new List<(int, int)>());
+        gained = m.Value;
+        return true;
     }
 
-    bool TrySource(int t, Model target, ref long budget, List<(int, int)> srcData, List<(int, int)> srcMap, List<int> markUsed)
+    bool TryHalf(Model m, out long gained)
     {
-        int s = TakeSource(t, budget, srcData);
-        if (s < 0) return false;
-        budget -= _inst.Models[s].Cost;
-        srcMap.Add((s, target.Id));
-        markUsed.Add(s);
-        return true;
+        gained = 0;
+        int mark = _journal.Count;
+        var markUsed = new List<int>();
+        var taken = new List<(int data, long key, int c)>();
+        var srcData = new List<(int, int)>();
+        var srcMap = new List<(int, int)>();
+        long budget = _energyLeft - m.Cost;
+        bool ok = true;
+        _used[m.Id] = true; // un modèle ne peut pas être sa propre source
+        for (int k = 0; k < m.Types.Length && ok; k++)
+        {
+            int t = m.Types[k];
+            bool sourceFirst = !m.ReqOk(k) || (_p.Sources && PeekSource(t) < ReqCost(t, m.Lb[k]));
+            bool done = false;
+            for (int attempt = 0; attempt < 2 && !done; attempt++)
+            {
+                bool useSource = (attempt == 0) == sourceFirst;
+                if (useSource)
+                {
+                    if (!_p.Sources) continue;
+                    if (!m.ReqOk(k) && attempt > 0) break;
+                    int s = TakeSource(t, budget, srcData);
+                    if (s >= 0) { budget -= _inst.Models[s].Cost; srcMap.Add((s, m.Id)); markUsed.Add(s); done = true; }
+                }
+                else if (m.ReqOk(k))
+                {
+                    int jm = _journal.Count; int tm = taken.Count;
+                    done = FillRequirement(t, m.Lb[k], m.Ub[k], CopyFirst, taken);
+                    if (!done) { Rollback(jm); taken.RemoveRange(tm, taken.Count - tm); }
+                }
+            }
+            ok = done;
+        }
+        if (ok)
+        {
+            bool halved = srcMap.Count > 0 || taken.Any(x => x.c == 1);
+            foreach (var (s, _) in srcMap) _energyLeft -= _inst.Models[s].Cost;
+            Commit(m, taken, srcData, srcMap);
+            gained = halved ? m.Value / 2 : m.Value;
+            return true;
+        }
+        Rollback(mark);
+        foreach (int id in markUsed) _used[id] = false;
+        _used[m.Id] = false;
+        return false;
     }
 
     void Commit(Model m, List<(int data, long key, int c)> taken, List<(int, int)> srcData, List<(int, int)> srcMap)
@@ -337,27 +511,89 @@ public sealed class Solver
         _journal.Clear();
     }
 
+    double[]? _srcCost;   // mode lagrangien : coût d'utiliser chaque modèle comme source
+
+    /// Coût (dans les unités du mode courant) d'un besoin rempli directement avec des datasets.
+    double ReqCost(int t, int lb) => _p.Prices is { } pr
+        ? pr.Total[t] * Math.Max(lb, 0) / Math.Max(1.0, _inst.Supply[t])
+        : DataW(t, lb);
+
     public Solution Run()
     {
-        var feasible = _inst.Models.Where(m => m.Feasible).ToArray();
+        var rng = new Random(_p.Seed);
+        var pr = _p.Prices;
+        var prio = new Dictionary<int, (double score, bool direct)>();
+        var monos = Enumerable.Range(0, 4).Select(t => !_p.Sources ? new List<Model>() :
+            _inst.Models.Where(m => m.AllReqOk && m.IsMono && m.Types[0] == t).ToList()).ToArray();
+        bool[] hasSource = monos.Select(l => l.Count > 0).ToArray();
+        var feasible = _inst.Models.Where(m => m.Lb.Length > 0 &&
+            Enumerable.Range(0, m.Lb.Length).All(k => m.ReqOk(k) || hasSource[m.Types[k]])).ToArray();
 
-        if (_p.Sources != SourceMode.None)
+        if (pr == null)
         {
             for (int t = 0; t < 4; t++)
-                _sourceCandidates[t] = feasible.Where(m => m.IsMono && m.Types[0] == t)
-                    .OrderBy(m => Weight(m) + 0.5 * m.Value / 1000.0 * 1e-4)
-                    .Select(m => m.Id).ToList();
+            {
+                _sourceCandidates[t] = monos[t].OrderBy(SourceWeight).Select(m => m.Id).ToList();
+                var l = _sourceCandidates[t];
+                int qi = Math.Min(l.Count - 1, (int)(_p.SrcQuantile * l.Count));
+                _srcEstimate[t] = l.Count == 0 ? double.PositiveInfinity : SourceWeight(_inst.Models[l[qi]]);
+            }
+            // Priorité = meilleure rentabilité entre "valeur pleine en direct" et "valeur/2 au moins cher".
+            foreach (var m in feasible)
+            {
+                if (m.Value <= 0) continue;
+                double noise = _p.Noise > 0 ? Math.Exp(_p.Noise * Gauss(rng)) : 1.0;
+                double d = m.Value / DirectWeight(m);
+                double h = m.Value / 2.0 / HalfWeight(m);
+                prio[m.Id] = (Math.Max(d, h) * noise, d >= h);
+            }
         }
-        else for (int t = 0; t < 4; t++) _sourceCandidates[t] = new List<int>();
-
-        var order = feasible.Where(m => m.Value > 0)
-            .OrderByDescending(m => m.Value / Weight(m)).ToArray();
+        else
+        {
+            // Profit réduit (relaxation lagrangienne) : valeur moins le prix des ressources consommées.
+            // Un besoin couvert par une source coûte le prix d'un "jeton" source du type.
+            _srcCost = new double[_inst.Models.Length];
+            var target = new double[_inst.Models.Length];
+            foreach (var m in feasible)
+            {
+                double e = pr.Energy * EnergyW(m.Cost);
+                double pf = m.AllReqOk && m.Value > 0 ? m.Value - e : double.NegativeInfinity;
+                double ph = m.Value > 0 ? m.Value / 2.0 - e : double.NegativeInfinity;
+                for (int k = 0; k < m.Types.Length; k++)
+                {
+                    int t = m.Types[k];
+                    double tot = ReqCost(t, m.Lb[k]);
+                    double free = _inst.FreeSupply[t] > 0 ? pr.Free[t] * Math.Max(m.Lb[k], 0) / _inst.FreeSupply[t] : double.PositiveInfinity;
+                    pf -= tot + free;
+                    double token = hasSource[t] ? pr.Token[t] : double.PositiveInfinity;
+                    ph -= m.ReqOk(k) ? Math.Min(tot, token) : token;
+                }
+                double best = Math.Max(pf, ph);
+                target[m.Id] = best;
+                if (m.IsMono && m.AllReqOk && _p.Sources)
+                {
+                    double own = pr.Energy * EnergyW(m.Cost) + ReqCost(m.Types[0], m.Lb[0]);
+                    _srcCost[m.Id] = own + Math.Max(0, best);
+                    // Modèle plus utile comme source que comme cible : on ne l'entraîne pas pour lui-même.
+                    if (pr.Token[m.Types[0]] - own > Math.Max(0, best)) continue;
+                }
+                if (m.Value <= 0 || double.IsNegativeInfinity(best)) continue;
+                prio[m.Id] = (best + _p.Noise * 100 * Gauss(rng), pf >= ph);
+            }
+            for (int t = 0; t < 4; t++)
+                _sourceCandidates[t] = monos[t].OrderBy(m => _srcCost[m.Id]).Select(m => m.Id).ToList();
+        }
+        var order = prio.OrderByDescending(kv => kv.Value.score).ToArray();
 
         long score = 0;
-        foreach (var m in order)
+        foreach (var (id, (_, direct)) in order)
         {
-            if (_used[m.Id]) continue;
-            if (TryTrain(m, out long g)) score += g;
+            if (_used[id]) continue;
+            var m = _inst.Models[id];
+            if (m.Cost > _energyLeft) continue;
+            long g;
+            if (direct && TryFullFree(m, out g)) { score += g; continue; }
+            if (TryHalf(m, out g)) score += g;
         }
         return new Solution
         {
@@ -365,6 +601,12 @@ public sealed class Solver
             DataMappings = new List<(int, int)>(_dataMap),
             ModelMappings = new List<(int, int)>(_modelMap)
         };
+    }
+
+    static double Gauss(Random r)
+    {
+        double u1 = 1.0 - r.NextDouble(), u2 = r.NextDouble();
+        return Math.Sqrt(-2 * Math.Log(u1)) * Math.Cos(2 * Math.PI * u2);
     }
 }
 
@@ -420,36 +662,93 @@ public static class Checker
 
 public static class Program
 {
+    // Variation multiplicative d'un paramètre, avec un plancher pour pouvoir quitter zéro.
+    static double Perturb(double x, Random r) => (x + 0.01) * Math.Exp(0.4 * (r.NextDouble() * 2 - 1)) - 0.01 is var y && y > 0 ? y : 0;
+
     public static int Main(string[] args)
     {
-        // Usage : IsogradIA <dossier datasets ou fichiers .json> [--out dossier]
+        // Usage : IsogradIA <dossier datasets ou fichiers .json> [--out dossier] [--time secondes]
         string outDir = "solutions";
+        double timeLimit = 30;
         var inputs = new List<string>();
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--out") outDir = args[++i];
+            else if (args[i] == "--time") timeLimit = double.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture);
             else if (Directory.Exists(args[i])) inputs.AddRange(Directory.GetFiles(args[i], "*.json").OrderBy(f => f));
             else inputs.Add(args[i]);
         }
         if (inputs.Count == 0) { Console.Error.WriteLine("Usage : IsogradIA <datasets...> [--out dossier]"); return 1; }
         Directory.CreateDirectory(outDir);
 
-        var configs = new List<Params>();
-        foreach (double lambda in new[] { 0.0, 0.1, 0.25, 0.5, 1, 2, 4, 8 })
-            foreach (var src in new[] { SourceMode.None, SourceMode.Fallback, SourceMode.Prefer })
-                configs.Add(new Params { Lambda = lambda, Sources = src });
-
         foreach (var path in inputs)
         {
             var sw = Stopwatch.StartNew();
             var inst = Instance.Load(path);
+            string name = Path.GetFileNameWithoutExtension(path);
+
+            // Phase 1 : grille de paramètres.
+            var configs = new List<Params>();
+            var lambdas = new[] { 0.0, 0.1, 0.3, 1, 3, 10, 30 };
+            foreach (double lf in lambdas)
+                foreach (double lc in lambdas)
+                    foreach (double q in new[] { 0.02, 0.15 })
+                    {
+                        configs.Add(new Params { LambdaFree = lf, LambdaCopy = lc, Sources = true, SrcQuantile = q });
+                        if (q == 0.02) configs.Add(new Params { LambdaFree = lf, LambdaCopy = lc, Sources = false, SrcQuantile = q });
+                    }
+            foreach (bool src in new[] { true, false })
+            {
+                var prices = Prices.Compute(inst, src);
+                foreach (double sc in new[] { 0.8, 0.9, 1.0, 1.1, 1.25 })
+                    foreach (double tk in src ? new[] { 0.7, 1.0, 1.4 } : new[] { 1.0 })
+                        configs.Add(new Params
+                        {
+                            Sources = src,
+                            Prices = new Prices { Energy = prices.Energy * sc, Free = prices.Free, Total = prices.Total,
+                                Token = prices.Token.Select(x => x * tk).ToArray() }
+                        });
+            }
             var results = new Solution[configs.Count];
             Parallel.For(0, configs.Count, i => results[i] = new Solver(inst, configs[i]).Run());
-            var best = results.OrderByDescending(r => r.Score).First();
+            int bi = Enumerable.Range(0, configs.Count).MaxBy(i => results[i].Score);
+            var best = results[bi]; var bestP = configs[bi];
+            long gridScore = best.Score;
+
+            // Phase 2 : recherche aléatoire autour de la meilleure configuration, jusqu'à la limite de temps.
+            var lockObj = new object();
+            int seed = 1;
+            Parallel.For(0, Environment.ProcessorCount, _ =>
+            {
+                while (sw.Elapsed.TotalSeconds < timeLimit)
+                {
+                    Params p;
+                    lock (lockObj)
+                    {
+                        var r = new Random(seed);
+                        p = new Params
+                        {
+                            LambdaFree = Perturb(bestP.LambdaFree, r),
+                            LambdaCopy = Perturb(bestP.LambdaCopy, r),
+                            Sources = bestP.Sources,
+                            SrcQuantile = Math.Clamp(bestP.SrcQuantile * Math.Exp(0.5 * (r.NextDouble() * 2 - 1)), 0.001, 0.9),
+                            Noise = 0.1 * r.NextDouble() * r.NextDouble(),
+                            Prices = bestP.Prices?.Scaled(r, 0.15),
+                            Seed = seed++
+                        };
+                    }
+                    var sol = new Solver(inst, p).Run();
+                    lock (lockObj)
+                        if (sol.Score > best.Score) { best = sol; bestP = p; }
+                }
+            });
+
             var (check, err) = Checker.Evaluate(inst, best);
-            string name = Path.GetFileNameWithoutExtension(path);
-            File.WriteAllText(Path.Combine(outDir, name + "_submission.json"), best.ToJson());
-            Console.WriteLine($"{name,-12} score={best.Score,10} vérifié={check,10} {(err == "" ? "OK" : "ERREUR " + err)}  [{best.Label}]  {sw.Elapsed.TotalSeconds:F1}s");
+            string outPath = Path.Combine(outDir, name + "_submission.json");
+            long previous = File.Exists(outPath) ? Checker.Evaluate(inst, Solution.FromJson(File.ReadAllText(outPath))).score : 0;
+            string status = err != "" ? "ERREUR " + err : check > previous ? "écrit" : $"gardé l'ancien ({previous})";
+            if (err == "" && check > previous) File.WriteAllText(outPath, best.ToJson());
+            Console.WriteLine($"{name,-12} grille={gridScore,10} final={check,10} {status}  [{best.Label}]  {sw.Elapsed.TotalSeconds:F0}s ({seed - 1} essais aléatoires)");
         }
         return 0;
     }

@@ -29,31 +29,32 @@
 
 Pièges repérés : des modèles avec `upperBound` négatif (impossibles), des modèles à coût énergie = 1 (quasi gratuits), des valeurs à 0, et des mono-types avec `lowerBound` = 1 (sources très bon marché en données).
 
-## Approche v1 (IsogradIA/Program.cs)
-1. Tri des modèles par `valeur / (coût/cap + λ × Σ lowerBound/offre du type)`.
-2. Pour chaque modèle : on tente un remplissage 100 % libre de droits (valeur pleine), sinon mixte (copyright en priorité pour garder les libres), avec éventuellement des sources.
-3. Remplissage d'un besoin : plus gros datasets d'abord, puis le plus petit dataset qui fait tomber la somme dans l'intervalle (gaspillage minimal).
-4. 24 configurations (8 valeurs de λ × 3 modes de sources) testées en parallèle, la meilleure est écrite et revérifiée par un vérificateur qui reproduit `test_solution.py`.
+## Approche (v2)
+1. **Prix lagrangiens** : un sous-gradient multiplicatif fixe un prix pour l'énergie, les données libres, les données totales (par type) et un "jeton source" par type. Chaque modèle choisit seul entre rien, valeur pleine, valeur/2 ou source ; les prix s'ajustent jusqu'à respecter les capacités.
+2. **Construction gloutonne** dans l'ordre des profits réduits : remplissage 100 % libre pour viser la valeur pleine, sinon copyright d'abord, et sources quand un jeton coûte moins cher que les données.
+3. **Remplissage d'un besoin** : gros datasets d'abord, puis on termine par un ou deux datasets qui tombent pile dans l'intervalle (indispensable pour 4_precise).
+4. **Besoins impossibles** (borne sup négative) : couverts par une source, ce que le vérificateur accepte.
+5. Grille de paramètres puis recherche aléatoire autour du meilleur réglage jusqu'à la limite de temps (`--time`). Une solution n'est écrite que si elle bat celle déjà présente.
 
-## Scores v1 (validés par test_solution.py)
-| Entrée | Score | Énergie utilisée |
+## Scores (validés par test_solution.py, 2026-10-09)
+| Entrée | Score | Meilleur du classement |
 |---|---|---|
-| 1_example | 12 946 (optimal, fait à la main) | 99,6 % |
-| 2_medium | 263 579 | 100 % |
-| 3_free | 523 522 | 100 % |
-| 4_precise | 849 327 | 100 % |
-| 5_energy | 3 703 281 | 88 % |
-| 6_shortage | 339 130 | 43 % |
-| 7_big | 5 697 964 | 100 % |
+| 1_example | 12 946 | 12 946 |
+| 2_medium | 271 544 | 272 308 |
+| 3_free | 523 684 | 523 758 |
+| 4_precise | 1 030 782 | 1 031 935 |
+| 5_energy | 3 761 990 | 3 785 898 |
+| 6_shortage | 659 450 | 669 603 |
+| 7_big | 5 820 862 | 5 822 471 |
 
-## Pistes d'amélioration
-- **6_shortage** : l'énergie n'est utilisée qu'à 43 %. Il faut exploiter massivement les sources (un petit dataset → une source mono-type à petit `lowerBound` → un besoin entier d'une cible).
-- **Entrées limitées par l'énergie (2, 4, 7)** : réserver les datasets libres aux modèles de plus forte valeur, puis recherche locale (échanger un modèle retenu contre un modèle exclu plus rentable).
-- **5_energy** : 98 % des datasets sont consommés ; réduire le gaspillage et le nombre de datasets par besoin.
-- **1_example** : 12 946 est atteignable (source mono-type n → modèle 1).
+1_example a été résolu à la main (source 0 vers le modèle 1).
+
+## Pistes restantes
+- 6_shortage et 5_energy : meilleure affectation des petits datasets aux sources (appariement), recherche locale.
+- Recherche locale générale : échanger un modèle retenu contre un exclu.
 
 ## Utilisation
 ```
-dotnet run -c Release -- <dossier datasets> --out <dossier solutions>
+dotnet run -c Release -- <dossier datasets> --out <dossier solutions> --time 60
 ```
 Sous Visual Studio : ouvrir `IsogradIA.sln`, et dans Propriétés > Déboguer, mettre en arguments le chemin du dossier `datasets`.
