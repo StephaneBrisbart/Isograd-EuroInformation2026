@@ -53,13 +53,18 @@ Pièges repérés : des modèles avec `upperBound` négatif (impossibles), des m
 ## Pistes restantes
 - 6_shortage : il reste environ 1,1 % de volume gaspillé ; choisir les sources en fonction des petits datasets disponibles (et pas seulement celles du LP).
 
+## Fichiers d'entrée
+Les 7 entrées du concours sont dans `datasets/` (identiques au kit de départ).
+
 ## Utilisation
 ```
 dotnet run -c Release -- <dossier datasets> --out <dossier solutions> --time 150   (--no-lp pour désactiver le LP)
 ```
 Sous Visual Studio : ouvrir `IsogradIA.sln`, et dans Propriétés > Déboguer, mettre en arguments le chemin du dossier `datasets`.
 
-## Mode faille (`--faille`, fichiers dans `solutions_faille/`)
+## Mode faille (`--faille`, fichiers dans `solutions_faille/`) : abandonné
+Le correcteur a été corrigé le 2026-10-10 (« Model -k does not exist ») : ces fichiers valent 0. Gardés pour l'historique.
+
 Le vérificateur ne borne pas les indices de `modelMappings` : une cible d'indice négatif -k désigne le modèle N-k et compte comme un modèle supplémentaire (valeur/2, chaque besoin couvert par une source). Ce mode ajoute ces copies au problème. C'est un bug du correcteur, pas une règle de l'énoncé : les solutions conformes restent dans `solutions/`.
 
 | Entrée | Score (faille) |

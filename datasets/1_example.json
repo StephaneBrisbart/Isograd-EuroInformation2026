@@ -1,0 +1,54 @@
+{
+  "comment": "Example", 
+  "energyCap": 184958, 
+  "models": [
+    {
+      "id": 0, 
+      "value": 6770, 
+      "energyCost": 70153, 
+      "dataRequirements": {
+        "n": {"lowerBound": 1462, "upperBound": 1749}
+      }
+    },
+    {
+      "id": 1,
+      "value": 16940,
+      "energyCost": 88492,
+      "dataRequirements": {
+        "t": {"lowerBound": 1888, "upperBound": 2330},
+        "n": {"lowerBound": 1892, "upperBound": 2003}
+      }
+    },
+    {
+      "id": 2,
+      "value": 9615,
+      "energyCost": 48961,
+      "dataRequirements": {
+        "t": {"lowerBound": 1973, "upperBound": 2500}
+      }
+    },
+    {
+      "id": 3,
+      "value": 3416,
+      "energyCost": 68214,
+      "dataRequirements": {
+        "n": {"lowerBound": 1520, "upperBound": 1810}
+      }
+    },
+    {
+      "id": 4,
+      "value": 4476,
+      "energyCost": 25558,
+      "dataRequirements": {
+        "i": {"lowerBound": 670, "upperBound": 995}
+      }
+    }
+  ],
+  "datasets": [
+    {"id": 0, "dataType": "n", "size": 1524, "isCopyrighted": 1},
+    {"id": 1, "dataType": "t", "size": 867, "isCopyrighted": 0},
+    {"id": 2, "dataType": "t", "size": 1149, "isCopyrighted": 1},
+    {"id": 3, "dataType": "i", "size": 740, "isCopyrighted": 1},
+    {"id": 4, "dataType": "i", "size": 918, "isCopyrighted": 0}
+  ]
+}

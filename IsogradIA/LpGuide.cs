@@ -15,9 +15,14 @@ public sealed class LpGuide
     public Prices Duals = new();
     public double Bound;
 
-    public static LpGuide Solve(Instance inst)
+    /// integer : résolution exacte en nombres entiers (SCIP) avec limite de temps ; les duaux viennent alors
+    /// de la relaxation. volFactor / freeFactor : marge sur les volumes pour absorber le surplus réel.
+    public static LpGuide Solve(Instance inst, bool integer = false, double timeLimitSec = 60, double volFactor = 1.0, double freeFactor = 1.0)
     {
-        var solver = Google.OrTools.LinearSolver.Solver.CreateSolver("GLOP");
+        Prices? lpDuals = integer ? Solve(inst).Duals : null;
+        var solver = Google.OrTools.LinearSolver.Solver.CreateSolver(integer ? "SCIP" : "GLOP");
+        if (integer) solver.SetTimeLimit((long)(timeLimitSec * 1000));
+        Variable NewVar() => integer ? solver.MakeIntVar(0, 1, "") : solver.MakeNumVar(0, 1, "");
         int n = inst.Models.Length;
         var g = new LpGuide
         {
@@ -27,9 +32,9 @@ public sealed class LpGuide
         var hasSrc = new bool[4];
         foreach (var m in inst.Models) if (m.IsMono && m.AllReqOk) hasSrc[m.Types[0]] = true;
 
-        var energy = solver.MakeConstraint(double.NegativeInfinity, 1.0);
-        var free = Enumerable.Range(0, 4).Select(_ => solver.MakeConstraint(double.NegativeInfinity, 1.0)).ToArray();
-        var total = Enumerable.Range(0, 4).Select(_ => solver.MakeConstraint(double.NegativeInfinity, 1.0)).ToArray();
+        var energy = solver.MakeConstraint(double.NegativeInfinity, integer ? 1.0 - 1e-12 : 1.0);
+        var free = Enumerable.Range(0, 4).Select(_ => solver.MakeConstraint(double.NegativeInfinity, freeFactor)).ToArray();
+        var total = Enumerable.Range(0, 4).Select(_ => solver.MakeConstraint(double.NegativeInfinity, volFactor)).ToArray();
         var token = Enumerable.Range(0, 4).Select(_ => solver.MakeConstraint(double.NegativeInfinity, 0.0)).ToArray();
         var obj = solver.Objective();
         obj.SetMaximization();
@@ -46,7 +51,7 @@ public sealed class LpGuide
 
             if (m.AllReqOk && m.Value > 0 && m.Types.All(t => inst.FreeSupply[t] > 0))
             {
-                var x = vf[m.Id] = solver.MakeNumVar(0, 1, "");
+                var x = vf[m.Id] = NewVar();
                 obj.SetCoefficient(x, m.Value); pick.SetCoefficient(x, 1); energy.SetCoefficient(x, e);
                 for (int k = 0; k < m.Lb.Length; k++)
                 {
@@ -57,7 +62,7 @@ public sealed class LpGuide
             }
             if (m.Value > 0 && srcOk)
             {
-                var x = vh[m.Id] = solver.MakeNumVar(0, 1, "");
+                var x = vh[m.Id] = NewVar();
                 obj.SetCoefficient(x, m.Value / 2.0); pick.SetCoefficient(x, 1); energy.SetCoefficient(x, e);
                 for (int k = 0; k < m.Lb.Length; k++)
                 {
@@ -65,7 +70,7 @@ public sealed class LpGuide
                     if (!m.ReqOk(k)) { token[t].SetCoefficient(x, token[t].GetCoefficient(x) + 1); continue; }
                     total[t].SetCoefficient(x, total[t].GetCoefficient(x) + (double)m.Lb[k] / inst.Supply[t]);
                     if (!hasSrc[t]) continue;
-                    var y = vy[m.Id][k] = solver.MakeNumVar(0, 1, "");
+                    var y = vy[m.Id][k] = NewVar();
                     token[t].SetCoefficient(y, 1);
                     total[t].SetCoefficient(y, -(double)m.Lb[k] / inst.Supply[t]);
                     var link = solver.MakeConstraint(double.NegativeInfinity, 0);
@@ -75,7 +80,7 @@ public sealed class LpGuide
             if (m.IsMono && m.AllReqOk)
             {
                 int t = m.Types[0];
-                var x = vs[m.Id] = solver.MakeNumVar(0, 1, "");
+                var x = vs[m.Id] = NewVar();
                 pick.SetCoefficient(x, 1); energy.SetCoefficient(x, e);
                 total[t].SetCoefficient(x, total[t].GetCoefficient(x) + (double)m.Lb[0] / inst.Supply[t]);
                 token[t].SetCoefficient(x, -1);
@@ -96,6 +101,7 @@ public sealed class LpGuide
                 g.TokenReq[i][k] = !inst.Models[i].ReqOk(k) ||
                     (vy[i]![k] is { } y && g.Xh[i] > 1e-6 && y.SolutionValue() >= 0.5 * g.Xh[i]);
         }
+        if (lpDuals != null) { g.Duals = lpDuals; return g; }
         g.Duals = new Prices
         {
             Energy = Math.Abs(energy.DualValue()),

@@ -642,6 +642,8 @@ public sealed class Solver
         _assign[id] = a;
     }
 
+    public void Fill() => InsertPass(null);
+
     /// Passe gloutonne : essaie d'entraîner, dans l'ordre de priorité, les modèles encore libres.
     List<int> InsertPass(HashSet<int>? tabu)
     {
@@ -1056,6 +1058,67 @@ public static class Program
         Console.WriteLine($"{name,-12} amélioration : {initial} -> {check} {(err == "" ? "" : "ERREUR " + err)}  {sw.Elapsed.TotalSeconds:F0}s");
     }
 
+    /// Mode --pack : plan MIP (volume libre x vf), puis emballage des datasets libres par recuit pour
+    /// réaliser les modèles à valeur pleine, puis construction gloutonne guidée du reste et recherche locale.
+    static void PackMode(Instance inst, string name, string outDir, double mipTime, double[] volFactors, double timeLimit, Stopwatch sw)
+    {
+        string outPath = Path.Combine(outDir, name + "_submission.json");
+        long previous = File.Exists(outPath) ? Checker.Evaluate(inst, Solution.FromJson(File.ReadAllText(outPath))).score : 0;
+        long iters = long.Parse(Environment.GetEnvironmentVariable("ISOGRAD_PACK_ITERS") ?? "20000000");
+        foreach (double vf in volFactors)
+        {
+            string cache = Path.Combine(outDir, $"mipfull_{name}_{vf}.txt");
+            if (Environment.GetEnvironmentVariable("ISOGRAD_PACK_TEST") == "1" && File.Exists(cache))
+            {
+                var ids = File.ReadAllText(cache).Split(',').Select(int.Parse).ToArray();
+                for (int s = 0; s < 3; s++)
+                {
+                    FreePacker.Realize(inst, ids.ToHashSet(), new Random(s), iters, Console.WriteLine, once: true);
+                    Console.WriteLine($"   essai {s} : {sw.Elapsed.TotalSeconds:F0}s");
+                }
+                continue;
+            }
+            var msw = Stopwatch.StartNew();
+            var mip = LpGuide.Solve(inst, integer: true, timeLimitSec: mipTime, volFactor: 1.0, freeFactor: vf);
+            Console.WriteLine($"{name,-12} MIP (libre x{vf}) = {mip.Bound:F0} ({msw.Elapsed.TotalSeconds:F0}s)");
+            File.WriteAllText(cache, string.Join(",", Enumerable.Range(0, inst.Models.Length).Where(id => mip.Xf[id] > 0.5)));
+            if (Environment.GetEnvironmentVariable("ISOGRAD_PACK_TEST") == "1")
+            {
+                for (int s = 0; s < 3; s++)
+                {
+                    var f = Enumerable.Range(0, inst.Models.Length).Where(id => mip.Xf[id] > 0.5).ToHashSet();
+                    FreePacker.Realize(inst, f, new Random(s), iters, Console.WriteLine, once: true);
+                    Console.WriteLine($"   essai {s} : {sw.Elapsed.TotalSeconds:F0}s");
+                }
+                continue;
+            }
+            int threads = Math.Min(Environment.ProcessorCount, 4);
+            var results = new Solution[threads];
+            double until = sw.Elapsed.TotalSeconds + timeLimit;
+            Parallel.For(0, threads, i =>
+            {
+                var rng = new Random(500 + i);
+                var full = Enumerable.Range(0, inst.Models.Length).Where(id => mip.Xf[id] > 0.5).ToHashSet();
+                var maps = FreePacker.Realize(inst, full, rng, iters, i == 0 ? Console.WriteLine : null);
+                var start = new Solution { DataMappings = maps };
+                var p = new Params { Sources = true, Lp = mip, LpWeight = 100, MinWaste = true, WasteTolerance = 100 * (i % 3), ReserveSources = i % 2 == 1, FreePenalty = 3000 };
+                var solver = new Solver(inst, p);
+                solver.Run(start);
+                long packed = solver.ToSolution().Score;
+                solver.Fill();
+                long filled = solver.ToSolution().Score;
+                solver.Improve(() => sw.Elapsed.TotalSeconds < until, rng, 2 + i);
+                results[i] = solver.ToSolution();
+                Console.WriteLine($"   fil {i} : pleins={packed} après remplissage={filled} après recherche={results[i].Score}");
+            });
+            var top = results.MaxBy(r => r.Score)!;
+            var (check, err) = Checker.Evaluate(inst, top);
+            string status = err != "" ? "ERREUR " + err : check > previous ? "écrit" : $"gardé l'ancien ({previous})";
+            if (err == "" && check > previous) { File.WriteAllText(outPath, top.ToJson()); previous = check; }
+            Console.WriteLine($"{name,-12} pack x{vf} : {check} {status}  {sw.Elapsed.TotalSeconds:F0}s");
+        }
+    }
+
     public static int Main(string[] args)
     {
         // Usage : IsogradIA <dossier datasets ou fichiers .json> [--out dossier] [--time secondes]
@@ -1063,7 +1126,10 @@ public static class Program
         double timeLimit = 30;
         bool useLp = true;
         bool improveOnly = false;
-        bool aliases = false;       // exploiter la faille des indices négatifs (fichiers séparés)   // repartir de la solution déjà écrite et seulement l'améliorer
+        bool aliases = false;
+        bool pack = false;           // réaliser le plan MIP en emballant les datasets libres (recuit)
+        double mipTime = 0;         // > 0 : résolution en nombres entiers (SCIP) pour guider la construction
+        double[] volFactors = { 1.0, 0.997 };       // exploiter la faille des indices négatifs (fichiers séparés)   // repartir de la solution déjà écrite et seulement l'améliorer
         var inputs = new List<string>();
         for (int i = 0; i < args.Length; i++)
         {
@@ -1071,6 +1137,9 @@ public static class Program
             else if (args[i] == "--no-lp") useLp = false;
             else if (args[i] == "--improve") improveOnly = true;
             else if (args[i] == "--faille") aliases = true;
+            else if (args[i] == "--pack") pack = true;
+            else if (args[i] == "--mip") mipTime = double.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture);
+            else if (args[i] == "--vol") volFactors = args[++i].Split(',').Select(x => double.Parse(x, System.Globalization.CultureInfo.InvariantCulture)).ToArray();
             else if (args[i] == "--time") timeLimit = double.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture);
             else if (Directory.Exists(args[i])) inputs.AddRange(Directory.GetFiles(args[i], "*.json").OrderBy(f => f));
             else inputs.Add(args[i]);
@@ -1083,6 +1152,11 @@ public static class Program
             var sw = Stopwatch.StartNew();
             var inst = Instance.Load(path, aliases);
             string name = Path.GetFileNameWithoutExtension(path);
+            if (pack)
+            {
+                PackMode(inst, name, outDir, mipTime, volFactors, timeLimit, sw);
+                continue;
+            }
             if (improveOnly)
             {
                 ImproveExisting(inst, name, outDir, useLp, timeLimit, sw);
@@ -1125,6 +1199,17 @@ public static class Program
                                 configs.Add(new Params { Sources = true, Lp = lp, LpWeight = 1, SourceLookahead = look,
                                     WasteTolerance = Math.Max(tol, 0), MinWaste = tol >= 0, ReserveSources = reserve, FreePenalty = fp });
             }
+            if (mipTime > 0)
+                foreach (double vf in volFactors)
+                {
+                    var msw = Stopwatch.StartNew();
+                    var mip = LpGuide.Solve(inst, integer: true, timeLimitSec: mipTime, volFactor: 1.0, freeFactor: vf);
+                    Console.WriteLine($"{name,-12} MIP (volume x{vf}) = {mip.Bound:F0} ({msw.Elapsed.TotalSeconds:F0}s)");
+                    foreach (bool reserve in new[] { false, true })
+                        foreach (int tol in new[] { -1, 100, 200 })
+                            configs.Add(new Params { Sources = true, Lp = mip, LpWeight = 100, ReserveSources = reserve, FreePenalty = 3000,
+                                WasteTolerance = Math.Max(tol, 0), MinWaste = tol >= 0 });
+                }
             var results = new Solution[configs.Count];
             Parallel.For(0, configs.Count, i => results[i] = new Solver(inst, configs[i]).Run());
             if (Environment.GetEnvironmentVariable("ISOGRAD_VERBOSE") == "1")
