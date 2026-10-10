@@ -58,3 +58,15 @@ Pièges repérés : des modèles avec `upperBound` négatif (impossibles), des m
 dotnet run -c Release -- <dossier datasets> --out <dossier solutions> --time 150   (--no-lp pour désactiver le LP)
 ```
 Sous Visual Studio : ouvrir `IsogradIA.sln`, et dans Propriétés > Déboguer, mettre en arguments le chemin du dossier `datasets`.
+
+## Mode faille (`--faille`, fichiers dans `solutions_faille/`)
+Le vérificateur ne borne pas les indices de `modelMappings` : une cible d'indice négatif -k désigne le modèle N-k et compte comme un modèle supplémentaire (valeur/2, chaque besoin couvert par une source). Ce mode ajoute ces copies au problème. C'est un bug du correcteur, pas une règle de l'énoncé : les solutions conformes restent dans `solutions/`.
+
+| Entrée | Score (faille) |
+|---|---|
+| 2_medium | 275 262 |
+| 3_free | 525 563 |
+| 4_precise | 1 031 651 |
+| 5_energy | 4 063 838 |
+| 6_shortage | 700 927 |
+| 7_big | 5 875 312 |

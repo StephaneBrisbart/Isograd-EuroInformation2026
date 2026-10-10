@@ -18,7 +18,12 @@ public sealed class Model
     public int[] Types = Array.Empty<int>(); // 0=n 1=t 2=i 3=c
     public int[] Lb = Array.Empty<int>();
     public int[] Ub = Array.Empty<int>();
-    public bool ReqOk(int k) => Lb[k] <= Ub[k] && Ub[k] > 0;
+    public bool ReqOk(int k) => !SourceOnly && Lb[k] <= Ub[k] && Ub[k] > 0;
+    // Mode "faille" : copie d'un modèle adressée par un indice négatif (OutId = Id - N dans la sortie).
+    // Le vérificateur ne borne pas les indices de modelMappings : la copie est une cible distincte,
+    // dont chaque besoin doit être couvert par une source.
+    public bool SourceOnly;
+    public int OutId;
     // Tous les besoins sont réalisables avec des datasets. Sinon, un besoin impossible
     // (borne sup négative...) peut quand même être couvert par une source : le vérificateur ne le contrôle pas.
     public bool AllReqOk => Lb.Length > 0 && Enumerable.Range(0, Lb.Length).All(ReqOk);
@@ -43,7 +48,9 @@ public sealed class Instance
 
     public static int TypeIndex(string s) => "ntic".IndexOf(s[0]);
 
-    public static Instance Load(string path)
+    public int RealCount;
+
+    public static Instance Load(string path, bool aliases = false)
     {
         using var doc = JsonDocument.Parse(File.ReadAllBytes(path));
         var root = doc.RootElement;
@@ -78,7 +85,17 @@ public sealed class Instance
                 Copy = d.GetProperty("isCopyrighted").GetInt32() != 0
             });
         }
-        inst.Models = models.OrderBy(m => m.Id).ToArray();
+        models = models.OrderBy(m => m.Id).ToList();
+        foreach (var m in models) m.OutId = m.Id;
+        inst.RealCount = models.Count;
+        if (aliases)
+            foreach (var m in models.ToList())
+                models.Add(new Model
+                {
+                    Id = inst.RealCount + m.Id, OutId = m.Id - inst.RealCount, SourceOnly = true,
+                    Value = m.Value, Cost = m.Cost, Types = m.Types, Lb = m.Lb, Ub = m.Ub
+                });
+        inst.Models = models.ToArray();
         inst.Datasets = datasets.OrderBy(d => d.Id).ToArray();
         foreach (var d in inst.Datasets)
         {
@@ -774,6 +791,13 @@ public sealed class Solver
     /// Charge une solution existante (déjà validée) dans l'état du solveur.
     void Load(Solution sol)
     {
+        int n2 = 2 * _inst.RealCount;
+        if (sol.ModelMappings.Any(x => x.target < 0) && _inst.Models.Length < n2) return; // copies non chargées
+        sol = new Solution
+        {
+            DataMappings = sol.DataMappings,
+            ModelMappings = sol.ModelMappings.Select(x => (x.source, x.target < 0 ? x.target + n2 : x.target)).ToList()
+        };
         var target = sol.ModelMappings.ToDictionary(x => x.source, x => x.target);
         var byModel = sol.DataMappings.GroupBy(x => x.model).ToDictionary(g => g.Key, g => g.Select(x => x.data).ToArray());
         var targets = byModel.Keys.Where(id => !target.ContainsKey(id)).Concat(sol.ModelMappings.Select(x => x.target)).Distinct();
@@ -795,9 +819,9 @@ public sealed class Solver
     public Solution ToSolution() => new Solution
     {
         Score = _score, Label = _p.ToString() + (Environment.GetEnvironmentVariable("ISOGRAD_VERBOSE") == "1" ? $" order[{string.Join(",", _order.Take(5).Select(o => o.id))}] n={_order.Length}" : ""),
-        DataMappings = _assign.SelectMany(kv => kv.Value.Data.Select(d => (d, kv.Key))
+        DataMappings = _assign.SelectMany(kv => kv.Value.Data.Select(d => (d, _inst.Models[kv.Key].OutId))
             .Concat(kv.Value.Sources.SelectMany(s => s.data.Select(d => (d, s.src))))).ToList(),
-        ModelMappings = _assign.SelectMany(kv => kv.Value.Sources.Select(s => (s.src, kv.Key))).ToList()
+        ModelMappings = _assign.SelectMany(kv => kv.Value.Sources.Select(s => (s.src, _inst.Models[kv.Key].OutId))).ToList()
     };
 
     double[]? _srcCost;   // mode lagrangien : coût d'utiliser chaque modèle comme source
@@ -948,6 +972,8 @@ public static class Checker
         var usedModels = new HashSet<int>();
         foreach (var (_, m) in sol.DataMappings) usedModels.Add(m);
         foreach (var (s, t) in sol.ModelMappings) { usedModels.Add(s); usedModels.Add(t); }
+        // Comme en Python, un indice négatif désigne le modèle N + indice.
+        Model Mod(int id) => inst.Models[id < 0 ? id + inst.RealCount : id];
         var fills = usedModels.ToDictionary(i => i, _ => new long[4]);
         var defiled = usedModels.ToDictionary(i => i, _ => false);
         var dataSeen = new HashSet<int>();
@@ -955,7 +981,7 @@ public static class Checker
         {
             if (!dataSeen.Add(d)) return (0, $"dataset {d} utilisé deux fois");
             var ds = inst.Datasets[d];
-            if (!inst.Models[m].Types.Contains(ds.Type)) return (0, $"type invalide {d}->{m}");
+            if (!Mod(m).Types.Contains(ds.Type)) return (0, $"type invalide {d}->{m}");
             fills[m][ds.Type] += ds.Size;
             defiled[m] |= ds.Copy;
         }
@@ -964,7 +990,7 @@ public static class Checker
         foreach (var (s, t) in sol.ModelMappings)
         {
             if (!sources.Add(s)) return (0, $"source {s} utilisée deux fois");
-            var sm = inst.Models[s];
+            var sm = Mod(s);
             if (!sm.IsMono) return (0, $"source {s} non mono-type");
             long f = fills[s][sm.Types[0]];
             if (f < sm.Lb[0] || f > sm.Ub[0]) return (0, $"source {s} mal remplie");
@@ -975,7 +1001,7 @@ public static class Checker
         foreach (int id in usedModels)
         {
             if (sources.Contains(id)) continue;
-            var m = inst.Models[id];
+            var m = Mod(id);
             for (int k = 0; k < m.Types.Length; k++)
             {
                 long f = fills[id][m.Types[k]];
@@ -1036,13 +1062,15 @@ public static class Program
         string outDir = "solutions";
         double timeLimit = 30;
         bool useLp = true;
-        bool improveOnly = false;   // repartir de la solution déjà écrite et seulement l'améliorer
+        bool improveOnly = false;
+        bool aliases = false;       // exploiter la faille des indices négatifs (fichiers séparés)   // repartir de la solution déjà écrite et seulement l'améliorer
         var inputs = new List<string>();
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--out") outDir = args[++i];
             else if (args[i] == "--no-lp") useLp = false;
             else if (args[i] == "--improve") improveOnly = true;
+            else if (args[i] == "--faille") aliases = true;
             else if (args[i] == "--time") timeLimit = double.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture);
             else if (Directory.Exists(args[i])) inputs.AddRange(Directory.GetFiles(args[i], "*.json").OrderBy(f => f));
             else inputs.Add(args[i]);
@@ -1053,7 +1081,7 @@ public static class Program
         foreach (var path in inputs)
         {
             var sw = Stopwatch.StartNew();
-            var inst = Instance.Load(path);
+            var inst = Instance.Load(path, aliases);
             string name = Path.GetFileNameWithoutExtension(path);
             if (improveOnly)
             {
