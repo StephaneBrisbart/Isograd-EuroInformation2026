@@ -34,17 +34,18 @@ Pièges repérés : des modèles avec `upperBound` négatif (impossibles), des m
 2. **Appariement global datasets → sources** : chaque source retenue par le LP reçoit à l'avance un seul dataset dont la taille tombe dans son intervalle (sources triées par borne sup, plus petit dataset suffisant). Le volume gaspillé sur 6_shortage passe de 490 k à 288 k.
 3. **Construction gloutonne** guidée par le LP : valeur pleine avec datasets libres, sinon copyright d'abord, sources pour les besoins que le LP couvre par jeton. Fin de remplissage par un dataset ou une paire avec un surplus toléré réglable.
 4. **Besoins impossibles** (borne sup négative) : couverts par une source, ce que le vérificateur accepte.
-5. Prix lagrangiens par sous-gradient comme alternative, grille de paramètres, recherche aléatoire, puis recherche locale « détruire / reconstruire » jusqu'à la limite (`--time`). Une solution n'est écrite que si elle bat celle déjà présente.
+5. Mode `--improve` : repart de la solution écrite et alterne réemballage global des datasets (valeurs pleines, puis sources, puis le reste) et recherche locale.
+6. Prix lagrangiens par sous-gradient comme alternative, grille de paramètres, recherche aléatoire, puis recherche locale « détruire / reconstruire » jusqu'à la limite (`--time`). Une solution n'est écrite que si elle bat celle déjà présente.
 
 ## Scores (validés par test_solution.py, 2026-10-09)
 | Entrée | Score | Borne LP | Meilleur du classement |
 |---|---|---|---|
 | 1_example | 12 946 | - | 12 946 |
-| 2_medium | 272 014 | 272 491 | 272 308 |
+| 2_medium | 272 035 | 272 491 | 272 308 |
 | 3_free | 523 698 | 523 761 | 523 758 |
 | 4_precise | 1 031 623 | 1 031 992 | 1 031 935 |
-| 5_energy | 3 773 272 | 3 788 025 | 3 785 898 |
-| 6_shortage | 664 040 | 671 259 | 669 603 |
+| 5_energy | 3 779 262 | 3 788 025 | 3 785 898 |
+| 6_shortage | 666 781 | 671 259 | 669 603 |
 | 7_big | 5 820 962 | 5 824 402 | 5 822 471 |
 
 1_example a été résolu à la main (source 0 vers le modèle 1). Le LP de 7_big prend environ 3 min.

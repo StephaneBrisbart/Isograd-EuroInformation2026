@@ -667,6 +667,131 @@ public sealed class Solver
         return accepted;
     }
 
+    /// Réemballage global : on rend tous les datasets, puis on remplit à nouveau tous les besoins
+    /// de la solution (cibles et sources) dans un ordre global (plus gros besoins d'abord), ce qui
+    /// réduit le surplus. Les modèles qui ne passent plus sont retirés, puis une passe gloutonne
+    /// réutilise le volume libéré. On annule si le score baisse.
+    public long Repack(int mode, Random? rng = null)
+    {
+        long before = _score;
+        var snap = _assign.ToList();
+        foreach (var (id, _) in snap) RemoveTarget(id);
+
+        // Un "job" = un besoin à remplir avec des datasets.
+        var jobs = new List<(int owner, int model, int k, bool full)>();
+        foreach (var (id, a) in snap)
+        {
+            var m = _inst.Models[id];
+            var srcTypes = a.Sources.Select(x => _inst.Models[x.src].Types[0]).ToHashSet();
+            bool full = a.Gain == m.Value && a.Sources.Length == 0 && m.Value > 0 && a.Data.All(d => !_inst.Datasets[d].Copy);
+            for (int k = 0; k < m.Types.Length; k++)
+                if (!srcTypes.Contains(m.Types[k])) jobs.Add((id, id, k, full));
+            foreach (var (src, _) in a.Sources) jobs.Add((id, src, 0, false));
+        }
+        int Lb(int model, int k) => _inst.Models[model].Lb[k];
+        var ordered = mode switch
+        {
+            0 => jobs.OrderByDescending(j => j.full).ThenByDescending(j => Lb(j.model, j.k)).ToList(),
+            1 => jobs.OrderByDescending(j => Lb(j.model, j.k)).ToList(),
+            2 => jobs.OrderByDescending(j => j.full).ThenByDescending(j => j.model == j.owner).ThenByDescending(j => Lb(j.model, j.k)).ToList(),
+            // Sources d'abord (appariement intervalles/points : borne sup croissante), puis les cibles.
+            4 => jobs.OrderBy(j => j.model == j.owner).ThenBy(j => j.model == j.owner ? 0 : _inst.Models[j.model].Ub[0])
+                     .ThenByDescending(j => j.full).ThenByDescending(j => Lb(j.model, j.k)).ToList(),
+            // Valeurs pleines (datasets libres) d'abord, puis sources, puis cibles à valeur/2.
+            6 => jobs.OrderByDescending(j => j.full).ThenBy(j => j.model == j.owner).ThenBy(j => j.model == j.owner ? 0 : _inst.Models[j.model].Ub[0])
+                     .ThenBy(j => Lb(j.model, j.k)).ToList(),
+            8 => jobs.OrderByDescending(j => j.full).ThenBy(j => j.model == j.owner).ThenBy(j => (j.model == j.owner ? 0 : _inst.Models[j.model].Ub[0]) + rng!.Next(300))
+                     .ThenBy(j => Lb(j.model, j.k) + rng!.Next(3000)).ToList(),
+            7 => jobs.OrderByDescending(j => j.full).ThenBy(j => j.model == j.owner).ThenBy(j => j.model == j.owner ? 0 : _inst.Models[j.model].Ub[0])
+                     .ThenByDescending(j => Lb(j.model, j.k)).ToList(),
+            5 => jobs.OrderBy(j => j.model == j.owner).ThenBy(j => j.model == j.owner ? 0 : _inst.Models[j.model].Ub[0])
+                     .ThenByDescending(j => j.full).ThenBy(j => Lb(j.model, j.k)).ToList(),
+            _ => jobs.OrderBy(_ => rng!.Next()).OrderByDescending(j => j.full).ThenByDescending(j => Lb(j.model, j.k) + rng!.Next(2000)).ToList(),
+        };
+
+        var data = jobs.Select(j => (j.owner, j.model)).Distinct().ToDictionary(x => x, _ => new List<int>());
+        var failed = new HashSet<int>();
+        var demoted = new List<(int owner, int model, int k, bool full)>();
+        foreach (var j in ordered)
+        {
+            if (failed.Contains(j.owner)) continue;
+            var m = _inst.Models[j.model];
+            var taken = new List<(int data, long key, int c)>();
+            int mark = _journal.Count;
+            if (FillRequirement(m.Types[j.k], m.Lb[j.k], m.Ub[j.k], j.full ? FreeOnly : CopyFirst, taken))
+                data[(j.owner, j.model)].AddRange(taken.Select(x => x.data));
+            else
+            {
+                Rollback(mark);
+                if (j.full) demoted.Add(j); else failed.Add(j.owner);
+            }
+        }
+        // Besoins "valeur pleine" non remplis en libre : on accepte du copyright (valeur/2).
+        foreach (var j in demoted)
+        {
+            if (failed.Contains(j.owner)) continue;
+            var m = _inst.Models[j.model];
+            var taken = new List<(int data, long key, int c)>();
+            int mark = _journal.Count;
+            if (FillRequirement(m.Types[j.k], m.Lb[j.k], m.Ub[j.k], CopyFirst, taken)) data[(j.owner, j.model)].AddRange(taken.Select(x => x.data));
+            else { Rollback(mark); failed.Add(j.owner); }
+        }
+        _journal.Clear();
+
+        foreach (var (id, a) in snap)
+        {
+            var m = _inst.Models[id];
+            var own = data.TryGetValue((id, id), out var l) ? l : new List<int>();
+            var srcs = a.Sources.Select(x => (x.src, (data.TryGetValue((id, x.src), out var sl) ? sl : new List<int>()).ToArray())).ToArray();
+            if (failed.Contains(id) || m.Cost + a.Sources.Sum(x => _inst.Models[x.src].Cost) > _energyLeft)
+            {
+                foreach (int d in own.Concat(srcs.SelectMany(x => x.Item2)))
+                    _pools.Add(_inst.Datasets[d].Type, _inst.Datasets[d].Copy ? 1 : 0, KeyOf(d));
+                continue;
+            }
+            var na = new Assign { Data = own.ToArray(), Sources = srcs };
+            bool halved = na.Sources.Length > 0 || na.Data.Any(d => _inst.Datasets[d].Copy);
+            na.Gain = halved ? m.Value / 2 : m.Value;
+            _energyLeft -= m.Cost; _used[id] = true;
+            foreach (var (src, _) in na.Sources) { _energyLeft -= _inst.Models[src].Cost; _used[src] = true; }
+            _score += na.Gain;
+            _assign[id] = na;
+        }
+        long afterRepack = _score;
+        InsertPass(null);
+        long delta = _score - before;
+        if (Environment.GetEnvironmentVariable("ISOGRAD_VERBOSE") == "1")
+            Console.WriteLine($"   repack mode={mode}: échecs={failed.Count} rétrogradés={demoted.Count} après réemballage {afterRepack - before:+#;-#;0} après insertion {delta:+#;-#;0}");
+
+        if (_score < before)
+        {
+            foreach (var id in _assign.Keys.ToList()) RemoveTarget(id);
+            foreach (var (id, a) in snap) Restore(id, a);
+        }
+        return delta;
+    }
+
+    /// Charge une solution existante (déjà validée) dans l'état du solveur.
+    void Load(Solution sol)
+    {
+        var target = sol.ModelMappings.ToDictionary(x => x.source, x => x.target);
+        var byModel = sol.DataMappings.GroupBy(x => x.model).ToDictionary(g => g.Key, g => g.Select(x => x.data).ToArray());
+        var targets = byModel.Keys.Where(id => !target.ContainsKey(id)).Concat(sol.ModelMappings.Select(x => x.target)).Distinct();
+        foreach (int id in targets)
+        {
+            var m = _inst.Models[id];
+            var a = new Assign
+            {
+                Data = byModel.TryGetValue(id, out var d) ? d : Array.Empty<int>(),
+                Sources = sol.ModelMappings.Where(x => x.target == id)
+                    .Select(x => (x.source, byModel.TryGetValue(x.source, out var sd) ? sd : Array.Empty<int>())).ToArray()
+            };
+            bool halved = a.Sources.Length > 0 || a.Data.Any(x => _inst.Datasets[x].Copy);
+            a.Gain = halved ? m.Value / 2 : m.Value;
+            Restore(id, a);
+        }
+    }
+
     public Solution ToSolution() => new Solution
     {
         Score = _score, Label = _p.ToString() + (Environment.GetEnvironmentVariable("ISOGRAD_VERBOSE") == "1" ? $" order[{string.Join(",", _order.Take(5).Select(o => o.id))}] n={_order.Length}" : ""),
@@ -712,7 +837,8 @@ public sealed class Solver
         ? pr.Total[t] * Math.Max(lb, 0) / Math.Max(1.0, _inst.Supply[t])
         : DataW(t, lb);
 
-    public Solution Run()
+    /// Construit une solution ; avec start, part d'une solution existante (priorités calculées, rien d'inséré).
+    public Solution Run(Solution? start = null)
     {
         var rng = new Random(_p.Seed);
         var pr = _pr = _p.Prices ?? _p.Lp?.Duals;
@@ -788,6 +914,7 @@ public sealed class Solver
                     : monos[t].OrderBy(m => _srcCost[m.Id])).Select(m => m.Id).ToList();
         }
         _order = prio.OrderByDescending(kv => kv.Value.score).Select(kv => (kv.Key, kv.Value.direct)).ToArray();
+        if (start != null) { Load(start); return ToSolution(); }
         if (lp != null && _p.ReserveSources) ReserveSourceDatasets(lp);
         InsertPass(null);
         if (_reserved != null)
@@ -868,17 +995,54 @@ public static class Program
     // Variation multiplicative d'un paramètre, avec un plancher pour pouvoir quitter zéro.
     static double Perturb(double x, Random r) => (x + 0.01) * Math.Exp(0.4 * (r.NextDouble() * 2 - 1)) - 0.01 is var y && y > 0 ? y : 0;
 
+    /// Mode --improve : on recharge la meilleure solution écrite, puis on alterne réemballage global
+    /// des datasets et recherche locale, sur plusieurs threads avec des réglages différents.
+    static void ImproveExisting(Instance inst, string name, string outDir, bool useLp, double timeLimit, Stopwatch sw)
+    {
+        string outPath = Path.Combine(outDir, name + "_submission.json");
+        if (!File.Exists(outPath)) { Console.WriteLine($"{name,-12} pas de solution à améliorer"); return; }
+        var start = Solution.FromJson(File.ReadAllText(outPath));
+        long initial = Checker.Evaluate(inst, start).score;
+        LpGuide? lp = useLp ? LpGuide.Solve(inst) : null;
+        int threads = Environment.ProcessorCount;
+        var results = new Solution[threads];
+        var tols = new[] { -1, 50, 200, 400, 100, 800, 0, 300 };
+        Parallel.For(0, threads, i =>
+        {
+            var rng = new Random(77 + i);
+            var p = new Params { Sources = true, Lp = lp, LpWeight = 1, MinWaste = tols[i % tols.Length] >= 0, WasteTolerance = Math.Max(0, tols[i % tols.Length]) };
+            if (lp == null) p.Prices = Prices.Compute(inst, true);
+            var solver = new Solver(inst, p);
+            var best = solver.Run(start);
+            while (sw.Elapsed.TotalSeconds < timeLimit)
+            {
+                solver.Repack(rng.Next(3) == 0 ? 6 : 8, rng);
+                var until = sw.Elapsed.TotalSeconds + 3;
+                solver.Improve(() => sw.Elapsed.TotalSeconds < Math.Min(until, timeLimit), rng, 2 + rng.Next(8));
+                var cur = solver.ToSolution();
+                if (cur.Score > best.Score) best = cur;
+            }
+            results[i] = best;
+        });
+        var top = results.MaxBy(r => r.Score)!;
+        var (check, err) = Checker.Evaluate(inst, top);
+        if (err == "" && check > initial) File.WriteAllText(outPath, top.ToJson());
+        Console.WriteLine($"{name,-12} amélioration : {initial} -> {check} {(err == "" ? "" : "ERREUR " + err)}  {sw.Elapsed.TotalSeconds:F0}s");
+    }
+
     public static int Main(string[] args)
     {
         // Usage : IsogradIA <dossier datasets ou fichiers .json> [--out dossier] [--time secondes]
         string outDir = "solutions";
         double timeLimit = 30;
         bool useLp = true;
+        bool improveOnly = false;   // repartir de la solution déjà écrite et seulement l'améliorer
         var inputs = new List<string>();
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--out") outDir = args[++i];
             else if (args[i] == "--no-lp") useLp = false;
+            else if (args[i] == "--improve") improveOnly = true;
             else if (args[i] == "--time") timeLimit = double.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture);
             else if (Directory.Exists(args[i])) inputs.AddRange(Directory.GetFiles(args[i], "*.json").OrderBy(f => f));
             else inputs.Add(args[i]);
@@ -891,6 +1055,11 @@ public static class Program
             var sw = Stopwatch.StartNew();
             var inst = Instance.Load(path);
             string name = Path.GetFileNameWithoutExtension(path);
+            if (improveOnly)
+            {
+                ImproveExisting(inst, name, outDir, useLp, timeLimit, sw);
+                continue;
+            }
 
             // Phase 1 : grille de paramètres.
             var configs = new List<Params>();
