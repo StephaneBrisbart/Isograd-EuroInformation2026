@@ -8,10 +8,10 @@ public static class FreePacker
     /// bins : (lb, ub) de chaque besoin ; sizes : tailles des datasets libres.
     /// Retourne pour chaque dataset l'indice du bac (-1 = non utilisé).
     static double Env(string k, double d) => double.TryParse(Environment.GetEnvironmentVariable(k), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : d;
-    public static long W = (long)Env("PACK_W", 32);
-    public static double T0 = Env("PACK_T0", 200), T1 = Env("PACK_T1", 0.5);
+    public static long W = (long)Env("PACK_W", 4), F = (long)Env("PACK_F", 5000), FV = (long)Env("PACK_FV", 0);
+    public static double T0 = Env("PACK_T0", 300), T1 = Env("PACK_T1", 1);
 
-    public static int[] Pack(int[] lb, int[] ub, int[] sizes, Random rng, long iterations)
+    public static int[] Pack(int[] lb, int[] ub, int[] sizes, Random rng, long iterations, long[]? fail = null)
     {
         int nb = lb.Length, ni = sizes.Length;
         var bin = new int[ni];
@@ -29,7 +29,8 @@ public static class FreePacker
             }
         }
         // Déficit fortement pénalisé ; le surplus au-dessus de lb coûte 1 (laisse du libre aux autres).
-        long Cost(int b, long s) => s < lb[b] ? W * (lb[b] - s) : s > ub[b] ? 2 * W * (s - ub[b]) + (ub[b] - lb[b]) : s - lb[b];
+        fail ??= Enumerable.Repeat(F, nb).ToArray();
+        long Cost(int b, long s) => s < lb[b] ? fail[b] + W * (lb[b] - s) : s > ub[b] ? fail[b] + W * (s - ub[b]) + (ub[b] - lb[b]) : s - lb[b];
         long total = 0;
         for (int b = 0; b < nb; b++) total += Cost(b, sum[b]);
         long best = total; var bestBin = (int[])bin.Clone();
@@ -79,7 +80,100 @@ public static class FreePacker
             }
             if (total < best) { best = total; Array.Copy(bin, bestBin, ni); }
         }
+        Repair(lb, ub, sizes, bestBin, rng);
+        if (Environment.GetEnvironmentVariable("PACK_DEBUG") == "1")
+        {
+            var sm = new long[nb];
+            for (int i = 0; i < ni; i++) if (bestBin[i] >= 0) sm[bestBin[i]] += sizes[i];
+            for (int b = 0; b < nb; b++)
+            {
+                if (sm[b] >= lb[b] && sm[b] <= ub[b]) continue;
+                var mine = Enumerable.Range(0, ni).Where(i => bestBin[i] == b).ToList();
+                Console.WriteLine($"   bac {b} lb={lb[b]} ub={ub[b]} somme={sm[b]} datasets=[{string.Join(",", mine.Select(i => sizes[i]))}] pool={bestBin.Count(x => x < 0)}");
+                int fixes = 0;
+                foreach (int x in mine)
+                    for (int j = 0; j < ni; j++)
+                    {
+                        int B = bestBin[j]; if (B == b) continue;
+                        long d = sizes[j] - sizes[x];
+                        long ns = sm[b] + d; if (ns < lb[b] || ns > ub[b]) continue;
+                        if (B >= 0 && (sm[B] - d < lb[B] || sm[B] - d > ub[B])) continue;
+                        fixes++;
+                    }
+                Console.WriteLine($"   échanges réparateurs : {fixes}; surplus total {Enumerable.Range(0, nb).Where(c => sm[c] >= lb[c]).Sum(c => sm[c] - lb[c])}");
+            }
+        }
         return bestBin;
+    }
+
+    /// Réparation exacte après le recuit : pour chaque bac en échec, on réemballe exhaustivement
+    /// ses datasets avec ceux d'un ou deux autres bacs (et de la réserve) pour que tous soient satisfaits.
+    static void Repair(int[] lb, int[] ub, int[] sizes, int[] bin, Random rng)
+    {
+        int nb = lb.Length, ni = sizes.Length;
+        var sum = new long[nb];
+        var members = Enumerable.Range(0, nb).Select(_ => new List<int>()).ToArray();
+        for (int i = 0; i < ni; i++) if (bin[i] >= 0) { sum[bin[i]] += sizes[i]; members[bin[i]].Add(i); }
+        bool Ok(int b) => sum[b] >= lb[b] && sum[b] <= ub[b];
+        // Petits datasets de la réserve, utilisables en plus.
+        var poolSmall = Enumerable.Range(0, ni).Where(i => bin[i] < 0).OrderBy(i => sizes[i]).Take(4).ToList();
+
+        // Essaie de répartir items entre les bacs bs (chacun satisfait) ; les items non placés vont en réserve
+        // seulement s'ils viennent de la réserve.
+        bool TryGroup(int[] bs, List<int> items)
+        {
+            int n = items.Count, k = bs.Length;
+            if (n > (k == 2 ? 18 : 12)) return false;
+            var assign = new int[n];
+            var acc = new long[k];
+            bool Rec(int idx)
+            {
+                if (idx == n)
+                {
+                    for (int q = 0; q < k; q++) if (acc[q] < lb[bs[q]]) return false;
+                    return true;
+                }
+                int it = items[idx];
+                for (int q = (bin[it] < 0 ? -1 : 0); q < k; q++)
+                {
+                    if (q >= 0 && acc[q] + sizes[it] > ub[bs[q]]) continue;
+                    assign[idx] = q;
+                    if (q >= 0) acc[q] += sizes[it];
+                    bool ok = Rec(idx + 1);
+                    if (q >= 0) acc[q] -= sizes[it];
+                    if (ok) return true;
+                }
+                return false;
+            }
+            if (!Rec(0)) return false;
+            for (int q = 0; q < k; q++) { members[bs[q]].Clear(); sum[bs[q]] = 0; }
+            for (int idx = 0; idx < n; idx++)
+            {
+                int it = items[idx], q = assign[idx];
+                bin[it] = q < 0 ? -1 : bs[q];
+                if (q >= 0) { members[bs[q]].Add(it); sum[bs[q]] += sizes[it]; }
+            }
+            return true;
+        }
+
+        for (int b = 0; b < nb; b++)
+        {
+            if (Ok(b)) continue;
+            bool done = false;
+            var partners = Enumerable.Range(0, nb).Where(c => c != b && Ok(c)).OrderBy(_ => rng.Next()).ToList();
+            foreach (int c in partners)
+            {
+                var items = members[b].Concat(members[c]).Concat(poolSmall.Where(i => bin[i] < 0)).ToList();
+                if (TryGroup(new[] { b, c }, items)) { done = true; break; }
+            }
+            for (int tries = 0; !done && tries < 20000; tries++)
+            {
+                int c = partners[rng.Next(partners.Count)], d = partners[rng.Next(partners.Count)];
+                if (c == d) continue;
+                var items = members[b].Concat(members[c]).Concat(members[d]).ToList();
+                if (TryGroup(new[] { b, c, d }, items)) done = true;
+            }
+        }
     }
 
     /// Bacs non satisfaits pour une affectation donnée.
@@ -110,15 +204,17 @@ public static class FreePacker
                 int[] lb = bins.Select(x => inst.Models[x.model].Lb[x.k]).ToArray();
                 int[] ub = bins.Select(x => inst.Models[x.model].Ub[x.k]).ToArray();
                 int[] sizes = data.Select(d => d.Size).ToArray();
-                var bin = Pack(lb, ub, sizes, rng, iterations);
+                var fl = bins.Select(x => F + FV * inst.Models[x.model].Value).ToArray();
+                var bin = Pack(lb, ub, sizes, rng, iterations, fl);
                 var failed = Failed(lb, ub, sizes, bin);
                 int nf = 0;
                 for (int b = 0; b < bins.Count; b++) if (failed[b]) { failedModels.Add(bins[b].model); nf++; }
                 for (int i = 0; i < data.Length; i++) if (bin[i] >= 0) result.Add((data[i].Id, bins[bin[i]].model));
                 long used = Enumerable.Range(0, data.Length).Where(i => bin[i] >= 0).Sum(i => (long)sizes[i]);
                 long defi = 0; { var sm = new long[lb.Length]; for (int i = 0; i < data.Length; i++) if (bin[i] >= 0) sm[bin[i]] += sizes[i]; for (int b = 0; b < lb.Length; b++) defi += Math.Max(0, lb[b] - sm[b]); }
-                log?.Invoke($"   type {"ntic"[t]} : {bins.Count} besoins, {nf} échecs (déficit {defi}), libre {used}/{sizes.Sum(x => (long)x)}, somme lb {lb.Sum(x => (long)x)}");
+                log?.Invoke($"   type {"ntic"[t]} : {bins.Count} besoins, {nf} échecs (déficit {defi}, valeur {Enumerable.Range(0, bins.Count).Where(b => failed[b]).Sum(b => inst.Models[bins[b].model].Value)}), libre {used}/{sizes.Sum(x => (long)x)}, somme lb {lb.Sum(x => (long)x)}");
             }
+            if (once) log?.Invoke($"   valeur des modèles en échec : {failedModels.Sum(id => inst.Models[id].Value)}");
             if (failedModels.Count == 0 || once) return result;
             log?.Invoke($"   {failedModels.Count} modèles retirés (valeur {failedModels.Sum(id => inst.Models[id].Value)})");
             full.ExceptWith(failedModels);

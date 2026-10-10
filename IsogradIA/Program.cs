@@ -1065,6 +1065,7 @@ public static class Program
         string outPath = Path.Combine(outDir, name + "_submission.json");
         long previous = File.Exists(outPath) ? Checker.Evaluate(inst, Solution.FromJson(File.ReadAllText(outPath))).score : 0;
         long iters = long.Parse(Environment.GetEnvironmentVariable("ISOGRAD_PACK_ITERS") ?? "20000000");
+        int packSeeds = int.Parse(Environment.GetEnvironmentVariable("ISOGRAD_PACK_SEEDS") ?? "3");
         foreach (double vf in volFactors)
         {
             string cache = Path.Combine(outDir, $"mipfull_{name}_{vf}.txt");
@@ -1098,8 +1099,15 @@ public static class Program
             Parallel.For(0, threads, i =>
             {
                 var rng = new Random(500 + i);
-                var full = Enumerable.Range(0, inst.Models.Length).Where(id => mip.Xf[id] > 0.5).ToHashSet();
-                var maps = FreePacker.Realize(inst, full, rng, iters, i == 0 ? Console.WriteLine : null);
+                List<(int data, int model)> maps = new(); long bestFull = -1;
+                for (int s = 0; s < packSeeds; s++)
+                {
+                    var full = Enumerable.Range(0, inst.Models.Length).Where(id => mip.Xf[id] > 0.5).ToHashSet();
+                    var m = FreePacker.Realize(inst, full, rng, iters, null);
+                    long v = full.Sum(id => inst.Models[id].Value);
+                    if (v > bestFull) { bestFull = v; maps = m; }
+                }
+                Console.WriteLine($"   fil {i} : valeur pleine réalisée {bestFull} / {Enumerable.Range(0, inst.Models.Length).Where(id => mip.Xf[id] > 0.5).Sum(id => inst.Models[id].Value)}");
                 var start = new Solution { DataMappings = maps };
                 var p = new Params { Sources = true, Lp = mip, LpWeight = 100, MinWaste = true, WasteTolerance = 100 * (i % 3), ReserveSources = i % 2 == 1, FreePenalty = 3000 };
                 var solver = new Solver(inst, p);
