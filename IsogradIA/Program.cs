@@ -1080,7 +1080,7 @@ public static class Program
                 continue;
             }
             var msw = Stopwatch.StartNew();
-            var mip = LpGuide.Solve(inst, integer: true, timeLimitSec: mipTime, volFactor: 1.0, freeFactor: vf);
+            var mip = LpGuide.Solve(inst, integer: true, timeLimitSec: mipTime, volFactor: Environment.GetEnvironmentVariable("ISOGRAD_TOTAL_VF") == "1" ? vf : 1.0, freeFactor: vf);
             Console.WriteLine($"{name,-12} MIP (libre x{vf}) = {mip.Bound:F0} ({msw.Elapsed.TotalSeconds:F0}s)");
             File.WriteAllText(cache, string.Join(",", Enumerable.Range(0, inst.Models.Length).Where(id => mip.Xf[id] > 0.5)));
             if (Environment.GetEnvironmentVariable("ISOGRAD_PACK_TEST") == "1")
@@ -1100,7 +1100,7 @@ public static class Program
             {
                 var rng = new Random(500 + i);
                 List<(int data, int model)> maps = new(); long bestFull = -1;
-                for (int s = 0; s < packSeeds; s++)
+                for (int s = 0; s < (Environment.GetEnvironmentVariable("ISOGRAD_PACK_ALL") == "1" ? 0 : packSeeds); s++)
                 {
                     var full = Enumerable.Range(0, inst.Models.Length).Where(id => mip.Xf[id] > 0.5).ToHashSet();
                     var m = FreePacker.Realize(inst, full, rng, iters, null);
@@ -1109,6 +1109,18 @@ public static class Program
                 }
                 Console.WriteLine($"   fil {i} : valeur pleine réalisée {bestFull} / {Enumerable.Range(0, inst.Models.Length).Where(id => mip.Xf[id] > 0.5).Sum(id => inst.Models[id].Value)}");
                 var start = new Solution { DataMappings = maps };
+                if (Environment.GetEnvironmentVariable("ISOGRAD_PACK_ALL") == "1")
+                {
+                    long bs = -1;
+                    for (int s = 0; s < packSeeds; s++)
+                    {
+                        var cand = FreePacker.RealizeAll(inst, mip, rng, iters, i == 0 && s == 0 ? Console.WriteLine : null);
+                        var (sc, er) = Checker.Evaluate(inst, cand);
+                        if (er != "") { Console.WriteLine($"   plan invalide : {er}"); continue; }
+                        if (sc > bs) { bs = sc; start = cand; }
+                    }
+                    Console.WriteLine($"   fil {i} : plan complet réalisé {bs} / MIP {mip.Bound:F0}");
+                }
                 var p = new Params { Sources = true, Lp = mip, LpWeight = 100, MinWaste = true, WasteTolerance = 100 * (i % 3), ReserveSources = i % 2 == 1, FreePenalty = 3000 };
                 var solver = new Solver(inst, p);
                 solver.Run(start);

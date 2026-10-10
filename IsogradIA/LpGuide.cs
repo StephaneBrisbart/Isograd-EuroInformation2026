@@ -36,6 +36,35 @@ public sealed class LpGuide
         var free = Enumerable.Range(0, 4).Select(_ => solver.MakeConstraint(double.NegativeInfinity, freeFactor)).ToArray();
         var total = Enumerable.Range(0, 4).Select(_ => solver.MakeConstraint(double.NegativeInfinity, volFactor)).ToArray();
         var token = Enumerable.Range(0, 4).Select(_ => solver.MakeConstraint(double.NegativeInfinity, 0.0)).ToArray();
+        // Contraintes de Hall par seuil de taille : les besoins de borne sup <= x ne peuvent être remplis
+        // qu'avec des datasets de taille <= x (granularité ignorée par les contraintes de volume).
+        bool hall = Environment.GetEnvironmentVariable("ISOGRAD_HALL") == "1";
+        var hx = new int[4][]; var hTot = new Constraint[4][]; var hFree = new Constraint[4][];
+        var hSupT = new double[4][]; var hSupF = new double[4][];
+        if (hall)
+            for (int t = 0; t < 4; t++)
+            {
+                var sz = inst.Datasets.Where(d => d.Type == t).Select(d => d.Size).OrderBy(x => x).ToArray();
+                if (sz.Length == 0) { hx[t] = Array.Empty<int>(); hTot[t] = hFree[t] = Array.Empty<Constraint>(); hSupT[t] = hSupF[t] = Array.Empty<double>(); continue; }
+                hx[t] = Enumerable.Range(1, 40).Select(q => sz[Math.Min(sz.Length - 1, (int)(sz.Length * Math.Pow(q / 40.0, 2)))]).Distinct().ToArray();
+                hSupT[t] = hx[t].Select(x => (double)inst.Datasets.Where(d => d.Type == t && d.Size <= x).Sum(d => (long)d.Size)).ToArray();
+                hSupF[t] = hx[t].Select(x => (double)inst.Datasets.Where(d => d.Type == t && !d.Copy && d.Size <= x).Sum(d => (long)d.Size)).ToArray();
+                hTot[t] = hSupT[t].Select(_ => solver.MakeConstraint(double.NegativeInfinity, volFactor)).ToArray();
+                hFree[t] = hSupF[t].Select(_ => solver.MakeConstraint(double.NegativeInfinity, freeFactor)).ToArray();
+            }
+        void Hall(Variable v, int t, int lb, int ub, double sign, bool freeToo)
+        {
+            if (!hall) return;
+            for (int q = 0; q < hx[t].Length; q++)
+            {
+                if (ub > hx[t][q]) continue;
+                if (hSupT[t][q] > 0) hTot[t][q].SetCoefficient(v, hTot[t][q].GetCoefficient(v) + sign * lb / hSupT[t][q]);
+                else if (sign > 0) hTot[t][q].SetCoefficient(v, hTot[t][q].GetCoefficient(v) + 2);
+                if (!freeToo) continue;
+                if (hSupF[t][q] > 0) hFree[t][q].SetCoefficient(v, hFree[t][q].GetCoefficient(v) + sign * lb / hSupF[t][q]);
+                else hFree[t][q].SetCoefficient(v, hFree[t][q].GetCoefficient(v) + 2);
+            }
+        }
         var obj = solver.Objective();
         obj.SetMaximization();
 
@@ -58,6 +87,7 @@ public sealed class LpGuide
                     int t = m.Types[k];
                     free[t].SetCoefficient(x, free[t].GetCoefficient(x) + (double)m.Lb[k] / inst.FreeSupply[t]);
                     total[t].SetCoefficient(x, total[t].GetCoefficient(x) + (double)m.Lb[k] / inst.Supply[t]);
+                    Hall(x, t, m.Lb[k], m.Ub[k], 1, true);
                 }
             }
             if (m.Value > 0 && srcOk)
@@ -69,10 +99,12 @@ public sealed class LpGuide
                     int t = m.Types[k];
                     if (!m.ReqOk(k)) { token[t].SetCoefficient(x, token[t].GetCoefficient(x) + 1); continue; }
                     total[t].SetCoefficient(x, total[t].GetCoefficient(x) + (double)m.Lb[k] / inst.Supply[t]);
+                    Hall(x, t, m.Lb[k], m.Ub[k], 1, false);
                     if (!hasSrc[t]) continue;
                     var y = vy[m.Id][k] = NewVar();
                     token[t].SetCoefficient(y, 1);
                     total[t].SetCoefficient(y, -(double)m.Lb[k] / inst.Supply[t]);
+                    Hall(y, t, m.Lb[k], m.Ub[k], -1, false);
                     var link = solver.MakeConstraint(double.NegativeInfinity, 0);
                     link.SetCoefficient(y, 1); link.SetCoefficient(x, -1);
                 }
@@ -83,6 +115,7 @@ public sealed class LpGuide
                 var x = vs[m.Id] = NewVar();
                 pick.SetCoefficient(x, 1); energy.SetCoefficient(x, e);
                 total[t].SetCoefficient(x, total[t].GetCoefficient(x) + (double)m.Lb[0] / inst.Supply[t]);
+                Hall(x, t, m.Lb[0], m.Ub[0], 1, false);
                 token[t].SetCoefficient(x, -1);
             }
         }
