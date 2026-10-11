@@ -235,6 +235,79 @@ public sealed class GraphSearch
         _failing[u] = _uBins[u].Count(x => !BinOk(x));
     }
 
+    int PickMono(int t)
+    {
+        _monos ??= Enumerable.Range(0, 4).Select(tt => _inst.Models.Where(m => m.IsMono && m.AllReqOk && !m.SourceOnly && m.Types[0] == tt).Select(m => m.Id).ToArray()).ToArray();
+        var monos = _monos[t];
+        if (monos.Length == 0) return -1;
+        int best = -1;
+        for (int tries = 0; tries < 8; tries++)
+        {
+            int c = monos[_rng.Next(monos.Length)];
+            if (_inUse[c] >= 0) continue;
+            if (best < 0 || _inst.Models[c].Lb[0] < _inst.Models[best].Lb[0]) best = c;
+        }
+        return best;
+    }
+
+    void SetBin(int u, int b, int model, int k)
+    {
+        var m = _inst.Models[model];
+        _bModel[b] = model; _bLb[b] = m.Lb[k]; _bUb[b] = m.Ub[k];
+        _failing[u] = _uBins[u].Count(x => !BinOk(x));
+    }
+
+    void AddSource(int u, int s) { _uSources[u] = _uSources[u].Append(s).ToArray(); _inUse[s] = u; long c = _inst.Models[s].Cost; _uCost[u] += c; _energyLeft -= c; }
+    void RemoveSource(int u, int s) { _uSources[u] = _uSources[u].Where(x => x != s).ToArray(); _inUse[s] = -1; long c = _inst.Models[s].Cost; _uCost[u] -= c; _energyLeft += c; }
+
+    /// Un besoin de la cible, rempli par des datasets, passe à une source (libère des données, coûte de l'énergie).
+    void Sourcify(double temp)
+    {
+        if (_activeUnits.Count == 0) return;
+        int u = _activeUnits[_rng.Next(_activeUnits.Count)];
+        int tg = _uTarget[u];
+        var own = _uBins[u].Where(x => _bModel[x] == tg).ToArray();
+        if (own.Length == 0) return;
+        int b = own[_rng.Next(own.Length)], t = _bType[b];
+        int s = PickMono(t);
+        if (s < 0 || _inst.Models[s].Cost > _energyLeft) return;
+        int k = Array.IndexOf(_inst.Models[tg].Types, t);
+        double before = LocalObj(new[] { u });
+        var saved = ItemsIn(b);
+        foreach (int i in saved) Move(i, -1);
+        AddSource(u, s); SetBin(u, b, s, 0);
+        GreedyFill(b, false);
+        double d = LocalObj(new[] { u }) - before;
+        if (_failing[u] == 0 && (d >= 0 || _rng.NextDouble() < Math.Exp(d / temp))) { _obj += d; return; }
+        foreach (int i in ItemsIn(b)) Move(i, -1);
+        RemoveSource(u, s); SetBin(u, b, tg, k);
+        foreach (int i in saved) Move(i, b);
+    }
+
+    /// Une source est retirée : le besoin correspondant de la cible est rempli directement par des datasets.
+    void Desourcify(double temp)
+    {
+        if (_activeUnits.Count == 0) return;
+        int u = _activeUnits[_rng.Next(_activeUnits.Count)];
+        if (_uSources[u].Length == 0) return;
+        int s = _uSources[u][_rng.Next(_uSources[u].Length)];
+        int tg = _uTarget[u], t = _inst.Models[s].Types[0];
+        int k = Array.IndexOf(_inst.Models[tg].Types, t);
+        if (k < 0 || !_inst.Models[tg].ReqOk(k)) return;
+        int b = _uBins[u].First(x => _bModel[x] == s);
+        double before = LocalObj(new[] { u });
+        var saved = ItemsIn(b);
+        foreach (int i in saved) Move(i, -1);
+        RemoveSource(u, s); SetBin(u, b, tg, k);
+        GreedyFill(b, _uSources[u].Length == 0);
+        double d = LocalObj(new[] { u }) - before;
+        if (_failing[u] == 0 && (d >= 0 || _rng.NextDouble() < Math.Exp(d / temp))) { _obj += d; return; }
+        foreach (int i in ItemsIn(b)) Move(i, -1);
+        if (_inUse[s] >= 0) { foreach (int i in saved) Move(i, -1); }
+        AddSource(u, s); SetBin(u, b, s, 0);
+        foreach (int i in saved) Move(i, b);
+    }
+
     /// Remplace une source d'une unité par un autre modèle mono-type libre du même type (souvent plus petit).
     void ReSource(double temp)
     {
@@ -318,10 +391,12 @@ public sealed class GraphSearch
                 }
             }
             else if (r < 88) ReSource(temp);
+            else if (r < 91) Sourcify(temp);
+            else if (r < 94) Desourcify(temp);
             else
             {
                 // Remplacer une unité active par une unité candidate (ou seulement en ajouter / retirer une).
-                int uOut = r < 95 && _activeUnits.Count > 0 ? _activeUnits[_rng.Next(_activeUnits.Count)] : -1;
+                int uOut = r < 98 && _activeUnits.Count > 0 ? _activeUnits[_rng.Next(_activeUnits.Count)] : -1;
                 int uIn = -1;
                 for (int tries = 0; tries < 8; tries++)
                 {
