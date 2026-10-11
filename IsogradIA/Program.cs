@@ -1139,6 +1139,35 @@ public static class Program
         }
     }
 
+    static double EnvD(string k, double d) => double.TryParse(Environment.GetEnvironmentVariable(k), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : d;
+
+    /// Mode --graph : recuit sur les liaisons datasets -> besoins -> modèles, depuis la solution écrite.
+    static void GraphMode(Instance inst, string name, string outDir, double timeLimit, Stopwatch sw)
+    {
+        string outPath = Path.Combine(outDir, name + "_submission.json");
+        if (!File.Exists(outPath)) { Console.WriteLine($"{name,-12} pas de solution de départ"); return; }
+        int threads = Environment.ProcessorCount;
+        long iters = (long)EnvD("GRAPH_ITERS", 200_000_000);
+        while (sw.Elapsed.TotalSeconds < timeLimit)
+        {
+            var start = Solution.FromJson(File.ReadAllText(outPath));
+            long initial = Checker.Evaluate(inst, start).score;
+            var results = new Solution[threads];
+            Parallel.For(0, threads, i =>
+            {
+                var g = new GraphSearch(inst, start, (int)(sw.ElapsedTicks % 100000) + 17 * i)
+                { Lambda = EnvD("GRAPH_LAMBDA", 0.005), Wdef = EnvD("GRAPH_W", 0.03) };
+                if (i == 0) Console.WriteLine($"   départ graphe : {g.Value} (vérif {initial})");
+                results[i] = g.Run(iters, EnvD("GRAPH_T0", 20), EnvD("GRAPH_T1", 0.05), () => sw.Elapsed.TotalSeconds < timeLimit, i == 0 ? Console.WriteLine : null);
+            });
+            var top = results.Select(r => (r, Checker.Evaluate(inst, r))).Where(x => x.Item2.error == "").MaxBy(x => x.Item2.score);
+            foreach (var r in results) { var (sc, er) = Checker.Evaluate(inst, r); if (er != "") Console.WriteLine($"   ERREUR graphe : {er}"); }
+            long previous = Checker.Evaluate(inst, Solution.FromJson(File.ReadAllText(outPath))).score;
+            if (top.r != null && top.Item2.score > previous) File.WriteAllText(outPath, top.r.ToJson());
+            Console.WriteLine($"{name,-12} graphe : {initial} -> {top.Item2.score}  {sw.Elapsed.TotalSeconds:F0}s");
+        }
+    }
+
     public static int Main(string[] args)
     {
         // Usage : IsogradIA <dossier datasets ou fichiers .json> [--out dossier] [--time secondes]
@@ -1147,6 +1176,7 @@ public static class Program
         bool useLp = true;
         bool improveOnly = false;
         bool aliases = false;
+        bool graph = false;          // recherche locale sur le graphe datasets / besoins / modèles
         bool pack = false;           // réaliser le plan MIP en emballant les datasets libres (recuit)
         double mipTime = 0;         // > 0 : résolution en nombres entiers (SCIP) pour guider la construction
         double[] volFactors = { 1.0, 0.997 };       // exploiter la faille des indices négatifs (fichiers séparés)   // repartir de la solution déjà écrite et seulement l'améliorer
@@ -1158,6 +1188,7 @@ public static class Program
             else if (args[i] == "--improve") improveOnly = true;
             else if (args[i] == "--faille") aliases = true;
             else if (args[i] == "--pack") pack = true;
+            else if (args[i] == "--graph") graph = true;
             else if (args[i] == "--mip") mipTime = double.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture);
             else if (args[i] == "--vol") volFactors = args[++i].Split(',').Select(x => double.Parse(x, System.Globalization.CultureInfo.InvariantCulture)).ToArray();
             else if (args[i] == "--time") timeLimit = double.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture);
@@ -1172,6 +1203,11 @@ public static class Program
             var sw = Stopwatch.StartNew();
             var inst = Instance.Load(path, aliases);
             string name = Path.GetFileNameWithoutExtension(path);
+            if (graph)
+            {
+                GraphMode(inst, name, outDir, timeLimit, sw);
+                continue;
+            }
             if (pack)
             {
                 PackMode(inst, name, outDir, mipTime, volFactors, timeLimit, sw);
