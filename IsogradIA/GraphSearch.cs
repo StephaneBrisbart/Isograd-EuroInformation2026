@@ -221,6 +221,53 @@ public sealed class GraphSearch
 
     public long Value => _value;
 
+    int[][]? _monos;
+
+    void SetSource(int u, int idx, int b, int s)
+    {
+        int old = _uSources[u][idx];
+        long dc = _inst.Models[s].Cost - _inst.Models[old].Cost;
+        _energyLeft -= dc; _uCost[u] += dc;
+        _inUse[old] = -1; _inUse[s] = u;
+        _uSources[u][idx] = s;
+        var m = _inst.Models[s];
+        _bModel[b] = s; _bLb[b] = m.Lb[0]; _bUb[b] = m.Ub[0];
+        _failing[u] = _uBins[u].Count(x => !BinOk(x));
+    }
+
+    /// Remplace une source d'une unité par un autre modèle mono-type libre du même type (souvent plus petit).
+    void ReSource(double temp)
+    {
+        _monos ??= Enumerable.Range(0, 4).Select(t => _inst.Models.Where(m => m.IsMono && m.AllReqOk && !m.SourceOnly && m.Types[0] == t).Select(m => m.Id).ToArray()).ToArray();
+        if (_activeUnits.Count == 0) return;
+        int u = _activeUnits[_rng.Next(_activeUnits.Count)];
+        var srcs = _uSources[u];
+        if (srcs.Length == 0) return;
+        int idx = _rng.Next(srcs.Length), sOld = srcs[idx];
+        int t = _inst.Models[sOld].Types[0];
+        var monos = _monos[t];
+        if (monos.Length == 0) return;
+        int sNew = -1;
+        for (int tries = 0; tries < 8; tries++)
+        {
+            int c = monos[_rng.Next(monos.Length)];
+            if (_inUse[c] >= 0) continue;
+            if (sNew < 0 || _inst.Models[c].Lb[0] < _inst.Models[sNew].Lb[0]) sNew = c;
+        }
+        if (sNew < 0 || _inst.Models[sNew].Cost - _inst.Models[sOld].Cost > _energyLeft) return;
+        int b = _uBins[u].First(x => _bModel[x] == sOld && _bUnit[x] == u && _bType[x] == t);
+        double before = LocalObj(new[] { u });
+        var saved = ItemsIn(b);
+        foreach (int i in saved) Move(i, -1);
+        SetSource(u, idx, b, sNew);
+        GreedyFill(b, false);
+        double d = LocalObj(new[] { u }) - before;
+        if (_failing[u] == 0 && (d >= 0 || _rng.NextDouble() < Math.Exp(d / temp))) { _obj += d; return; }
+        foreach (int i in ItemsIn(b)) Move(i, -1);
+        SetSource(u, idx, b, sOld);
+        foreach (int i in saved) Move(i, b);
+    }
+
     /// Recuit : renvoie la meilleure solution réalisable trouvée (unités satisfaites seulement).
     public Solution Run(long iterations, double t0, double t1, Func<bool> keepGoing, Action<string>? log = null)
     {
@@ -270,6 +317,7 @@ public sealed class GraphSearch
                     else { Move(j, -1); Move(i, from); Move(j, bj); }
                 }
             }
+            else if (r < 88) ReSource(temp);
             else
             {
                 // Remplacer une unité active par une unité candidate (ou seulement en ajouter / retirer une).
