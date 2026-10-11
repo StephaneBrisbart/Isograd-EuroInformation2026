@@ -53,6 +53,21 @@ Pièges repérés : des modèles avec `upperBound` négatif (impossibles), des m
 ## Pistes restantes
 - 6_shortage : il reste environ 1,1 % de volume gaspillé ; choisir les sources en fonction des petits datasets disponibles (et pas seulement celles du LP).
 
+## Scores finaux (solutions conformes, validés par test_solution.py, 2026-10-11)
+| Entrée | Score | Meilleur du classement |
+|---|---|---|
+| 1_example | 12 946 | 12 946 |
+| 2_medium | 272 126 | 272 322 |
+| 3_free | 523 735 | 523 758 |
+| 4_precise | 1 031 646 | 1 031 941 |
+| 5_energy | 3 784 025 | 3 786 106 |
+| 6_shortage | 667 369 | 669 704 |
+| 7_big | 5 821 527 | 5 822 560 |
+
+Méthodes ajoutées après la v5 :
+- `--pack` : plan MIP (SCIP) puis emballage des datasets libres par recuit simulé et réparation exacte (gros gain sur 5).
+- `--graph` : recherche locale sur le graphe datasets / besoins / modèles (idée de Stéphane) : déplacer ou échanger un dataset, remplacer un modèle, remplacer / ajouter / retirer une source (gros gain sur 6).
+
 ## Fichiers d'entrée
 Les 7 entrées du concours sont dans `datasets/` (identiques au kit de départ).
 
